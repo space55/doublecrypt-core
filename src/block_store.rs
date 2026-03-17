@@ -2,7 +2,7 @@ use crate::error::{FsError, FsResult};
 use rand::RngCore;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{Seek, SeekFrom, Write};
 use std::os::unix::fs::FileExt;
 use std::sync::Mutex;
 
@@ -168,6 +168,155 @@ impl DiskBlockStore {
 }
 
 impl BlockStore for DiskBlockStore {
+    fn block_size(&self) -> usize {
+        self.block_size
+    }
+
+    fn total_blocks(&self) -> u64 {
+        self.total_blocks
+    }
+
+    fn read_block(&self, block_id: u64) -> FsResult<Vec<u8>> {
+        if block_id >= self.total_blocks {
+            return Err(FsError::BlockOutOfRange(block_id));
+        }
+        let offset = block_id * self.block_size as u64;
+        let mut buf = vec![0u8; self.block_size];
+        self.file
+            .read_exact_at(&mut buf, offset)
+            .map_err(|e| FsError::Internal(format!("read block {block_id}: {e}")))?;
+        Ok(buf)
+    }
+
+    fn write_block(&self, block_id: u64, data: &[u8]) -> FsResult<()> {
+        if block_id >= self.total_blocks {
+            return Err(FsError::BlockOutOfRange(block_id));
+        }
+        if data.len() != self.block_size {
+            return Err(FsError::BlockSizeMismatch {
+                expected: self.block_size,
+                got: data.len(),
+            });
+        }
+        let offset = block_id * self.block_size as u64;
+        self.file
+            .write_all_at(data, offset)
+            .map_err(|e| FsError::Internal(format!("write block {block_id}: {e}")))?;
+        Ok(())
+    }
+
+    fn sync(&self) -> FsResult<()> {
+        self.file
+            .sync_all()
+            .map_err(|e| FsError::Internal(format!("fsync: {e}")))
+    }
+}
+
+/// Block-device-backed block store for raw devices such as EBS volumes.
+///
+/// Unlike [`DiskBlockStore`] which operates on regular files, this backend
+/// targets raw block devices (e.g. `/dev/xvdf`, `/dev/nvme1n1p1`).  The
+/// device must already exist; Linux does not allow creating device nodes
+/// from userspace in the normal flow.
+///
+/// Device size is discovered via `lseek(SEEK_END)` because `stat()` reports
+/// `st_size = 0` for block devices.  I/O uses `pread`/`pwrite` (via
+/// [`FileExt`]) exactly like `DiskBlockStore`.
+pub struct DeviceBlockStore {
+    file: File,
+    block_size: usize,
+    total_blocks: u64,
+}
+
+impl DeviceBlockStore {
+    /// Open an existing block device.
+    ///
+    /// `total_blocks` – pass 0 to infer from the device size.
+    pub fn open(path: &str, block_size: usize, total_blocks: u64) -> FsResult<Self> {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(|e| FsError::Internal(format!("open device {path}: {e}")))?;
+
+        let device_size = file
+            .seek(SeekFrom::End(0))
+            .map_err(|e| FsError::Internal(format!("seek device {path}: {e}")))?;
+
+        let total_blocks = if total_blocks == 0 {
+            device_size / block_size as u64
+        } else {
+            total_blocks
+        };
+
+        let required = total_blocks * block_size as u64;
+        if device_size < required {
+            return Err(FsError::Internal(format!(
+                "device too small: {device_size} bytes, need {required}"
+            )));
+        }
+
+        Ok(Self {
+            file,
+            block_size,
+            total_blocks,
+        })
+    }
+
+    /// Initialize a block device by filling every block with random data so
+    /// that free space is indistinguishable from ciphertext.
+    ///
+    /// **Warning:** this writes to *every* block and can take a long time on
+    /// large volumes.  Call this once when first provisioning the device.
+    ///
+    /// `total_blocks` – pass 0 to use the entire device.
+    pub fn initialize(path: &str, block_size: usize, total_blocks: u64) -> FsResult<Self> {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(|e| FsError::Internal(format!("open device {path}: {e}")))?;
+
+        let device_size = file
+            .seek(SeekFrom::End(0))
+            .map_err(|e| FsError::Internal(format!("seek device {path}: {e}")))?;
+
+        let total_blocks = if total_blocks == 0 {
+            device_size / block_size as u64
+        } else {
+            total_blocks
+        };
+
+        let required = total_blocks * block_size as u64;
+        if device_size < required {
+            return Err(FsError::Internal(format!(
+                "device too small: {device_size} bytes, need {required}"
+            )));
+        }
+
+        // Seek back to the start before writing.
+        file.seek(SeekFrom::Start(0))
+            .map_err(|e| FsError::Internal(format!("seek device {path}: {e}")))?;
+
+        let mut rng = rand::thread_rng();
+        let mut buf = vec![0u8; block_size];
+        for _ in 0..total_blocks {
+            rng.fill_bytes(&mut buf);
+            file.write_all(&buf)
+                .map_err(|e| FsError::Internal(format!("write device {path}: {e}")))?;
+        }
+        file.sync_all()
+            .map_err(|e| FsError::Internal(format!("sync device {path}: {e}")))?;
+
+        Ok(Self {
+            file,
+            block_size,
+            total_blocks,
+        })
+    }
+}
+
+impl BlockStore for DeviceBlockStore {
     fn block_size(&self) -> usize {
         self.block_size
     }

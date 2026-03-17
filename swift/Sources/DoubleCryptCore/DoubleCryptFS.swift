@@ -119,6 +119,60 @@ public final class DoubleCryptFS {
         return DoubleCryptFS(handle: handle)
     }
 
+    /// Initialize a raw block device (e.g. an EBS volume) as a new encrypted filesystem.
+    ///
+    /// This fills the device with random data so free space is indistinguishable
+    /// from ciphertext. **Warning:** this writes to every block and can take a
+    /// long time on large devices.
+    ///
+    /// - Parameters:
+    ///   - path: Path to the block device, e.g. `/dev/xvdf`.
+    ///   - totalBlocks: Number of blocks to use. Pass 0 to use the entire device.
+    ///   - blockSize: Block size in bytes. Pass 0 for the default (65536).
+    ///   - key: 32-byte master encryption key.
+    public static func initializeDevice(
+        path: String,
+        totalBlocks: UInt64 = 0,
+        blockSize: UInt32 = 0,
+        key: Data
+    ) throws -> DoubleCryptFS {
+        let handle: OpaquePointer? = key.withUnsafeBytes { keyBuf -> OpaquePointer? in
+            guard let ptr = keyBuf.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
+                return nil
+            }
+            return path.withCString { cPath in
+                fs_create_device(cPath, totalBlocks, blockSize, 1, ptr, UInt(keyBuf.count))
+            }
+        }
+        guard let handle else { throw DoubleCryptError.ioError }
+        return DoubleCryptFS(handle: handle)
+    }
+
+    /// Open an existing encrypted filesystem on a raw block device.
+    ///
+    /// - Parameters:
+    ///   - path: Path to the block device, e.g. `/dev/xvdf`.
+    ///   - totalBlocks: Number of blocks. Pass 0 to infer from the device size.
+    ///   - blockSize: Block size in bytes. Pass 0 for the default (65536).
+    ///   - key: 32-byte master encryption key.
+    public static func openDevice(
+        path: String,
+        totalBlocks: UInt64 = 0,
+        blockSize: UInt32 = 0,
+        key: Data
+    ) throws -> DoubleCryptFS {
+        let handle: OpaquePointer? = key.withUnsafeBytes { keyBuf -> OpaquePointer? in
+            guard let ptr = keyBuf.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
+                return nil
+            }
+            return path.withCString { cPath in
+                fs_create_device(cPath, totalBlocks, blockSize, 0, ptr, UInt(keyBuf.count))
+            }
+        }
+        guard let handle else { throw DoubleCryptError.ioError }
+        return DoubleCryptFS(handle: handle)
+    }
+
     // MARK: - Lifecycle
 
     /// Initialize a fresh filesystem on the block store. Call once after ``createOnDisk(path:totalBlocks:blockSize:key:)`` or ``createInMemory(totalBlocks:key:)``.

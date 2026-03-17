@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use crate::block_store::{BlockStore, DiskBlockStore, MemoryBlockStore};
+use crate::block_store::{BlockStore, DeviceBlockStore, DiskBlockStore, MemoryBlockStore};
 use crate::crypto::ChaChaEngine;
 use crate::error::FsError;
 use crate::fs::FilesystemCore;
@@ -910,5 +910,276 @@ fn test_disk_backed_filesystem_full_cycle() {
         assert_eq!(data, b"Hello from disk!");
     }
 
+    std::fs::remove_file(&path).unwrap();
+}
+
+// ── DeviceBlockStore tests ──
+
+/// Helper: create a pre-sized temp file to simulate a block device.
+/// Real block devices can't be created in tests, but DeviceBlockStore
+/// works on any seekable file — the key difference from DiskBlockStore
+/// is the lseek(SEEK_END) size discovery path.
+fn create_fake_device(name: &str, block_size: usize, total_blocks: u64) -> (String, std::path::PathBuf) {
+    let dir = std::env::temp_dir();
+    let path = dir.join(format!("doublecrypt_dev_{}_{}.raw", name, std::process::id()));
+    let path_str = path.to_str().unwrap().to_string();
+    let _ = std::fs::remove_file(&path);
+
+    // Pre-allocate the file to the correct size so it behaves like a device.
+    let size = block_size as u64 * total_blocks;
+    let file = std::fs::File::create(&path).unwrap();
+    file.set_len(size).unwrap();
+    drop(file);
+
+    (path_str, path)
+}
+
+#[test]
+fn test_device_block_store_open_and_roundtrip() {
+    let (path_str, path) = create_fake_device("open_rt", 256, 16);
+
+    let store = DeviceBlockStore::open(&path_str, 256, 0).unwrap();
+    assert_eq!(store.total_blocks(), 16);
+    assert_eq!(store.block_size(), 256);
+
+    let data = vec![0xCD; 256];
+    store.write_block(0, &data).unwrap();
+    store.write_block(15, &data).unwrap();
+
+    let read0 = store.read_block(0).unwrap();
+    assert_eq!(read0, data);
+    let read15 = store.read_block(15).unwrap();
+    assert_eq!(read15, data);
+
+    // Out of range.
+    assert!(store.read_block(16).is_err());
+    assert!(store.write_block(16, &data).is_err());
+
+    // Wrong block size.
+    assert!(store.write_block(0, &[0u8; 128]).is_err());
+
+    store.sync().unwrap();
+    std::fs::remove_file(&path).unwrap();
+}
+
+#[test]
+fn test_device_block_store_open_infers_total_blocks() {
+    let (path_str, path) = create_fake_device("infer", 512, 32);
+
+    // Pass total_blocks = 0 to infer from device size.
+    let store = DeviceBlockStore::open(&path_str, 512, 0).unwrap();
+    assert_eq!(store.total_blocks(), 32);
+
+    // Pass explicit count that fits.
+    let store2 = DeviceBlockStore::open(&path_str, 512, 16).unwrap();
+    assert_eq!(store2.total_blocks(), 16);
+
+    std::fs::remove_file(&path).unwrap();
+}
+
+#[test]
+fn test_device_block_store_device_too_small() {
+    let (path_str, path) = create_fake_device("small", 256, 4);
+
+    // Request more blocks than fit.
+    let result = DeviceBlockStore::open(&path_str, 256, 100);
+    assert!(result.is_err());
+
+    std::fs::remove_file(&path).unwrap();
+}
+
+#[test]
+fn test_device_block_store_initialize_fills_with_random() {
+    let (path_str, path) = create_fake_device("init", 256, 8);
+
+    let store = DeviceBlockStore::initialize(&path_str, 256, 0).unwrap();
+    assert_eq!(store.total_blocks(), 8);
+
+    // After initialize, blocks should NOT be all zeroes (they're random-filled).
+    // It's statistically impossible for 256 random bytes to be all zero.
+    let mut any_nonzero = false;
+    for blk in 0..8 {
+        let data = store.read_block(blk).unwrap();
+        if data.iter().any(|&b| b != 0) {
+            any_nonzero = true;
+            break;
+        }
+    }
+    assert!(any_nonzero, "initialize should fill blocks with random data");
+
+    std::fs::remove_file(&path).unwrap();
+}
+
+#[test]
+fn test_device_backed_filesystem_full_cycle() {
+    let (path_str, path) = create_fake_device("fs_cycle", DEFAULT_BLOCK_SIZE, 256);
+    let crypto = Arc::new(ChaChaEngine::generate().unwrap());
+
+    // Initialize the device and create a filesystem.
+    {
+        let store = Arc::new(DeviceBlockStore::initialize(&path_str, DEFAULT_BLOCK_SIZE, 0).unwrap());
+        let mut fs = FilesystemCore::new(store, crypto.clone());
+        fs.init_filesystem().unwrap();
+
+        fs.create_file("secret.txt").unwrap();
+        fs.write_file("secret.txt", 0, b"Top secret data on a device!").unwrap();
+
+        fs.create_directory("vault").unwrap();
+
+        fs.create_file("large.bin").unwrap();
+        let big = vec![0x42; 100_000];
+        fs.write_file("large.bin", 0, &big).unwrap();
+
+        fs.sync().unwrap();
+    }
+
+    // Reopen the device and verify data persists.
+    {
+        let store = Arc::new(DeviceBlockStore::open(&path_str, DEFAULT_BLOCK_SIZE, 0).unwrap());
+        assert_eq!(store.total_blocks(), 256);
+
+        let mut fs = FilesystemCore::new(store, crypto.clone());
+        fs.open().unwrap();
+
+        let entries = fs.list_directory().unwrap();
+        assert_eq!(entries.len(), 3);
+
+        let data = fs.read_file("secret.txt", 0, 1024).unwrap();
+        assert_eq!(data, b"Top secret data on a device!");
+
+        let big = fs.read_file("large.bin", 0, 200_000).unwrap();
+        assert_eq!(big.len(), 100_000);
+        assert!(big.iter().all(|&b| b == 0x42));
+
+        // Mutate: rename and delete.
+        fs.rename("secret.txt", "classified.txt").unwrap();
+        fs.remove_file("vault").unwrap();
+        fs.sync().unwrap();
+    }
+
+    // Third open — verify mutations persisted.
+    {
+        let store = Arc::new(DeviceBlockStore::open(&path_str, DEFAULT_BLOCK_SIZE, 0).unwrap());
+        let mut fs = FilesystemCore::new(store, crypto.clone());
+        fs.open().unwrap();
+
+        let entries = fs.list_directory().unwrap();
+        assert_eq!(entries.len(), 2);
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"classified.txt"));
+        assert!(names.contains(&"large.bin"));
+        assert!(!names.contains(&"vault"));
+
+        let data = fs.read_file("classified.txt", 0, 1024).unwrap();
+        assert_eq!(data, b"Top secret data on a device!");
+    }
+
+    std::fs::remove_file(&path).unwrap();
+}
+
+#[test]
+fn test_device_open_with_wrong_key_fails() {
+    let (path_str, path) = create_fake_device("wrongkey", DEFAULT_BLOCK_SIZE, 64);
+
+    let crypto1 = Arc::new(ChaChaEngine::generate().unwrap());
+    let crypto2 = Arc::new(ChaChaEngine::generate().unwrap());
+
+    // Init with key 1.
+    {
+        let store = Arc::new(DeviceBlockStore::initialize(&path_str, DEFAULT_BLOCK_SIZE, 0).unwrap());
+        let mut fs = FilesystemCore::new(store, crypto1.clone());
+        fs.init_filesystem().unwrap();
+        fs.create_file("test.txt").unwrap();
+        fs.write_file("test.txt", 0, b"data").unwrap();
+        fs.sync().unwrap();
+    }
+
+    // Try to open with key 2 — should fail.
+    {
+        let store = Arc::new(DeviceBlockStore::open(&path_str, DEFAULT_BLOCK_SIZE, 0).unwrap());
+        let mut fs = FilesystemCore::new(store, crypto2);
+        assert!(fs.open().is_err());
+    }
+
+    // Verify key 1 still works.
+    {
+        let store = Arc::new(DeviceBlockStore::open(&path_str, DEFAULT_BLOCK_SIZE, 0).unwrap());
+        let mut fs = FilesystemCore::new(store, crypto1);
+        fs.open().unwrap();
+        let data = fs.read_file("test.txt", 0, 1024).unwrap();
+        assert_eq!(data, b"data");
+    }
+
+    std::fs::remove_file(&path).unwrap();
+}
+
+#[test]
+fn test_device_overwrite_and_extend_file() {
+    let (path_str, path) = create_fake_device("overwrite", DEFAULT_BLOCK_SIZE, 128);
+    let crypto = Arc::new(ChaChaEngine::generate().unwrap());
+
+    let store = Arc::new(DeviceBlockStore::initialize(&path_str, DEFAULT_BLOCK_SIZE, 0).unwrap());
+    let mut fs = FilesystemCore::new(store, crypto);
+    fs.init_filesystem().unwrap();
+
+    fs.create_file("data.bin").unwrap();
+
+    // Write initial data.
+    fs.write_file("data.bin", 0, b"AAAAAAAAAA").unwrap();
+    let v1 = fs.read_file("data.bin", 0, 1024).unwrap();
+    assert_eq!(v1, b"AAAAAAAAAA");
+
+    // Overwrite middle.
+    fs.write_file("data.bin", 3, b"BBB").unwrap();
+    let v2 = fs.read_file("data.bin", 0, 1024).unwrap();
+    assert_eq!(v2, b"AAABBBAAAA");
+
+    // Extend past the end.
+    fs.write_file("data.bin", 8, b"CCCCCC").unwrap();
+    let v3 = fs.read_file("data.bin", 0, 1024).unwrap();
+    assert_eq!(v3.len(), 14); // "AAABBBAA" + "CCCCCC"
+    assert_eq!(&v3[..3], b"AAA");
+    assert_eq!(&v3[3..6], b"BBB");
+    assert_eq!(&v3[8..], b"CCCCCC");
+
+    fs.sync().unwrap();
+    std::fs::remove_file(&path).unwrap();
+}
+
+#[test]
+fn test_device_multiple_files_and_directories() {
+    let (path_str, path) = create_fake_device("multi", DEFAULT_BLOCK_SIZE, 256);
+    let crypto = Arc::new(ChaChaEngine::generate().unwrap());
+
+    let store = Arc::new(DeviceBlockStore::initialize(&path_str, DEFAULT_BLOCK_SIZE, 0).unwrap());
+    let mut fs = FilesystemCore::new(store, crypto);
+    fs.init_filesystem().unwrap();
+
+    // Create a mix of files and directories.
+    for i in 0..10 {
+        fs.create_file(&format!("file_{i}.txt")).unwrap();
+        fs.write_file(&format!("file_{i}.txt"), 0, format!("content_{i}").as_bytes()).unwrap();
+    }
+    for i in 0..5 {
+        fs.create_directory(&format!("dir_{i}")).unwrap();
+    }
+
+    let entries = fs.list_directory().unwrap();
+    assert_eq!(entries.len(), 15);
+
+    // Verify each file has the correct content.
+    for i in 0..10 {
+        let data = fs.read_file(&format!("file_{i}.txt"), 0, 1024).unwrap();
+        assert_eq!(data, format!("content_{i}").as_bytes());
+    }
+
+    // Delete some entries.
+    fs.remove_file("file_0.txt").unwrap();
+    fs.remove_file("dir_0").unwrap();
+
+    let entries = fs.list_directory().unwrap();
+    assert_eq!(entries.len(), 13);
+
+    fs.sync().unwrap();
     std::fs::remove_file(&path).unwrap();
 }

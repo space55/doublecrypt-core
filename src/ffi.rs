@@ -18,7 +18,7 @@ use std::os::raw::c_char;
 use std::ptr;
 use std::sync::Arc;
 
-use crate::block_store::{DiskBlockStore, MemoryBlockStore};
+use crate::block_store::{DeviceBlockStore, DiskBlockStore, MemoryBlockStore};
 use crate::crypto::ChaChaEngine;
 use crate::error::FsErrorCode;
 use crate::fs::FilesystemCore;
@@ -109,6 +109,67 @@ pub unsafe extern "C" fn fs_create_disk(
         }
     } else {
         match DiskBlockStore::open(path_str, bs, total_blocks) {
+            Ok(s) => Arc::new(s),
+            Err(_) => return ptr::null_mut(),
+        }
+    };
+
+    let crypto = match ChaChaEngine::new(key_slice) {
+        Ok(c) => Arc::new(c),
+        Err(_) => return ptr::null_mut(),
+    };
+
+    let core = FilesystemCore::new(store, crypto);
+    let handle = Box::new(FsHandle { core });
+    Box::into_raw(handle)
+}
+
+/// Create a filesystem handle backed by a raw block device (e.g. `/dev/xvdf`).
+///
+/// `path`: null-terminated path to the block device.
+/// `total_blocks`: number of blocks. Pass 0 to infer from the device size.
+/// `block_size`: block size in bytes. Pass 0 to use the default (65536).
+/// `initialize`: if nonzero, fill the device with random data first (slow on
+///               large devices). If zero, open the device as-is.
+/// `master_key`: pointer to the master encryption key bytes.
+/// `master_key_len`: length of master_key in bytes (should be 32).
+///
+/// Returns a pointer to an opaque handle, or null on failure.
+///
+/// # Safety
+/// - `path` must be a valid null-terminated C string.
+/// - `master_key` must point to `master_key_len` valid bytes.
+#[no_mangle]
+pub unsafe extern "C" fn fs_create_device(
+    path: *const c_char,
+    total_blocks: u64,
+    block_size: u32,
+    initialize: i32,
+    master_key: *const u8,
+    master_key_len: usize,
+) -> *mut FsHandle {
+    if master_key.is_null() || master_key_len == 0 {
+        return ptr::null_mut();
+    }
+    let path_str = match unsafe { unsafe_cstr_to_str(path) } {
+        Some(s) => s,
+        None => return ptr::null_mut(),
+    };
+    let key_slice = unsafe { std::slice::from_raw_parts(master_key, master_key_len) };
+
+    let bs = if block_size == 0 {
+        DEFAULT_BLOCK_SIZE
+    } else {
+        block_size as usize
+    };
+
+    let store = if initialize != 0 {
+        match DeviceBlockStore::initialize(path_str, bs, total_blocks) {
+            Ok(s) => Arc::new(s),
+            Err(_) => return ptr::null_mut(),
+        }
+    } else {
+        match DeviceBlockStore::open(path_str, bs, total_blocks) {
             Ok(s) => Arc::new(s),
             Err(_) => return ptr::null_mut(),
         }
