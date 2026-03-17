@@ -15,6 +15,7 @@ cargo install cbindgen
 ```
 
 This produces:
+
 - `target/release/libdoublecrypt_core.a` — static library linked by Swift
 - `include/doublecrypt_core.h` — auto-generated C header (do not edit by hand)
 
@@ -127,21 +128,21 @@ do {
 
 Error cases:
 
-| Case | Meaning |
-|------|---------|
-| `.notFound` | File or directory does not exist |
-| `.alreadyExists` | Name already taken |
-| `.noSpace` | Block store is full |
-| `.invalidArgument` | Null pointer, bad name, or invalid parameter |
-| `.notInitialized` | Called `mount()` on unformatted image, or operated before init/mount |
-| `.ioError` | Disk I/O failure |
-| `.cryptoError` | Decryption failed (wrong key or corrupted data) |
-| `.internalError` | Serialization or unexpected internal failure |
-| `.bufferTooSmall` | Read buffer too small (should not occur via Swift wrapper) |
-| `.notAFile` | Tried to read/write a directory |
-| `.notADirectory` | Tried to list a file |
-| `.directoryNotEmpty` | Tried to remove non-empty directory |
-| `.nameTooLong` | Filename exceeds 255 bytes |
+| Case                 | Meaning                                                              |
+| -------------------- | -------------------------------------------------------------------- |
+| `.notFound`          | File or directory does not exist                                     |
+| `.alreadyExists`     | Name already taken                                                   |
+| `.noSpace`           | Block store is full                                                  |
+| `.invalidArgument`   | Null pointer, bad name, or invalid parameter                         |
+| `.notInitialized`    | Called `mount()` on unformatted image, or operated before init/mount |
+| `.ioError`           | Disk I/O failure                                                     |
+| `.cryptoError`       | Decryption failed (wrong key or corrupted data)                      |
+| `.internalError`     | Serialization or unexpected internal failure                         |
+| `.bufferTooSmall`    | Read buffer too small (should not occur via Swift wrapper)           |
+| `.notAFile`          | Tried to read/write a directory                                      |
+| `.notADirectory`     | Tried to list a file                                                 |
+| `.directoryNotEmpty` | Tried to remove non-empty directory                                  |
+| `.nameTooLong`       | Filename exceeds 255 bytes                                           |
 
 ### Types
 
