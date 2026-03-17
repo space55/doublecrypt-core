@@ -29,3 +29,4 @@ include/
 # Swift Package Manager build artifacts
 swift/.build/
 swift/Package.resolved
+swift/.swiftpm/xcode/xcuserdata
