@@ -22,3 +22,10 @@ target
 
 .DS_Store
 *.dcfs
+
+# Auto-generated C header (regenerate with ./build-swift.sh)
+include/
+
+# Swift Package Manager build artifacts
+swift/.build/
+swift/Package.resolved
