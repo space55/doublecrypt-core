@@ -2,10 +2,10 @@
 import PackageDescription
 
 let package = Package(
-    name: "DoubleCrypt",
+    name: "DoubleCryptCore",
     platforms: [.macOS(.v13), .iOS(.v16)],
     products: [
-        .library(name: "DoubleCrypt", targets: ["DoubleCrypt"]),
+        .library(name: "DoubleCryptCore", targets: ["DoubleCryptCore"]),
     ],
     targets: [
         // System library that imports the C header via module.modulemap.
@@ -15,9 +15,9 @@ let package = Package(
             path: "CDoubleCrypt"
         ),
         .target(
-            name: "DoubleCrypt",
+            name: "DoubleCryptCore",
             dependencies: ["CDoubleCrypt"],
-            path: "Sources/DoubleCrypt",
+            path: "Sources/DoubleCryptCore",
             linkerSettings: [
                 .unsafeFlags([
                     "-L", "../target/release",      // Universal / host builds

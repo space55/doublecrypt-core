@@ -1,4 +1,4 @@
-# DoubleCrypt Swift Library
+# DoubleCryptCore Swift Library
 
 Encrypted filesystem core for macOS / iOS. All data at rest is encrypted with ChaCha20-Poly1305; the backing store sees only opaque ciphertext blocks.
 
@@ -23,7 +23,7 @@ This produces:
 
 1. In Xcode, **File → Add Package Dependencies → Add Local…** and select the `swift/` directory.
 2. Add `libdoublecrypt_core.a` (from `target/release/`) to your target's **Link Binary With Libraries** build phase.
-3. `import DoubleCrypt` in your Swift files.
+3. `import DoubleCryptCore` in your Swift files.
 
 Or, in another Swift package, add a local dependency:
 
@@ -36,7 +36,7 @@ Or, in another Swift package, add a local dependency:
 ### Initialization
 
 ```swift
-import DoubleCrypt
+import DoubleCryptCore
 
 // A 32-byte encryption key. In production, derive from a passphrase via Argon2 / scrypt.
 let key: Data = ...  // exactly 32 bytes
