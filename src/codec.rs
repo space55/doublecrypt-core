@@ -1,7 +1,16 @@
+use rand::RngCore;
+
 use crate::block_store::BlockStore;
 use crate::crypto::{decrypt_object, encrypt_object, CryptoEngine};
 use crate::error::{FsError, FsResult};
 use crate::model::*;
+
+/// Create a block-sized buffer filled with random bytes.
+fn random_block(size: usize) -> Vec<u8> {
+    let mut buf = vec![0u8; size];
+    rand::thread_rng().fill_bytes(&mut buf);
+    buf
+}
 
 /// Trait for serializing and deserializing logical objects to/from bytes.
 pub trait ObjectCodec: Send + Sync {
@@ -40,8 +49,8 @@ pub fn write_encrypted_object<T: serde::Serialize>(
         return Err(FsError::DataTooLarge(envelope_bytes.len()));
     }
 
-    // Pad to block size.
-    let mut block = vec![0u8; block_size];
+    // Pad to block size with random bytes so padding is indistinguishable from ciphertext.
+    let mut block = random_block(block_size);
     // First 4 bytes: little-endian length of the envelope.
     let len = envelope_bytes.len() as u32;
     block[..4].copy_from_slice(&len.to_le_bytes());
@@ -91,7 +100,7 @@ pub fn write_encrypted_raw(
         return Err(FsError::DataTooLarge(envelope_bytes.len()));
     }
 
-    let mut block = vec![0u8; block_size];
+    let mut block = random_block(block_size);
     let len = envelope_bytes.len() as u32;
     block[..4].copy_from_slice(&len.to_le_bytes());
     block[4..4 + envelope_bytes.len()].copy_from_slice(&envelope_bytes);

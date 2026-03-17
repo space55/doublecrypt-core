@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use crate::block_store::MemoryBlockStore;
+use crate::block_store::{BlockStore, DiskBlockStore, MemoryBlockStore};
 use crate::crypto::ChaChaEngine;
 use crate::error::FsError;
 use crate::fs::FilesystemCore;
@@ -837,4 +837,78 @@ fn test_many_commits_alternate_root_pointers() {
 
     let entries = fs2.list_directory().unwrap();
     assert_eq!(entries.len(), 10);
+}
+
+// ── Disk block store filesystem integration ──
+
+#[test]
+fn test_disk_backed_filesystem_full_cycle() {
+    let dir = std::env::temp_dir();
+    let path = dir.join(format!("doublecrypt_fs_test_{}.img", std::process::id()));
+    let path_str = path.to_str().unwrap();
+    let _ = std::fs::remove_file(&path);
+
+    let crypto = Arc::new(ChaChaEngine::generate().unwrap());
+
+    // Create image, init filesystem, write data.
+    {
+        let store = Arc::new(DiskBlockStore::create(path_str, DEFAULT_BLOCK_SIZE, 256).unwrap());
+        let mut fs = FilesystemCore::new(store, crypto.clone());
+        fs.init_filesystem().unwrap();
+
+        fs.create_file("hello.txt").unwrap();
+        fs.write_file("hello.txt", 0, b"Hello from disk!").unwrap();
+
+        fs.create_directory("docs").unwrap();
+
+        fs.create_file("big.bin").unwrap();
+        let big_data = vec![0xBE; 100_000];
+        fs.write_file("big.bin", 0, &big_data).unwrap();
+
+        fs.sync().unwrap();
+    }
+
+    // Reopen from the same file.
+    {
+        let store = Arc::new(DiskBlockStore::open(path_str, DEFAULT_BLOCK_SIZE, 256).unwrap());
+        let mut fs = FilesystemCore::new(store, crypto.clone());
+        fs.open().unwrap();
+
+        let entries = fs.list_directory().unwrap();
+        assert_eq!(entries.len(), 3);
+
+        let data = fs.read_file("hello.txt", 0, 1024).unwrap();
+        assert_eq!(data, b"Hello from disk!");
+
+        let big = fs.read_file("big.bin", 0, 200_000).unwrap();
+        assert_eq!(big.len(), 100_000);
+        assert!(big.iter().all(|&b| b == 0xBE));
+
+        // Continue mutating.
+        fs.rename("hello.txt", "greeting.txt").unwrap();
+        fs.remove_file("docs").unwrap();
+        fs.sync().unwrap();
+    }
+
+    // Third open — verify mutations persisted.
+    {
+        let store = Arc::new(DiskBlockStore::open(path_str, DEFAULT_BLOCK_SIZE, 0).unwrap());
+        assert_eq!(store.total_blocks(), 256);
+
+        let mut fs = FilesystemCore::new(store, crypto.clone());
+        fs.open().unwrap();
+
+        let entries = fs.list_directory().unwrap();
+        assert_eq!(entries.len(), 2);
+
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"greeting.txt"));
+        assert!(names.contains(&"big.bin"));
+        assert!(!names.contains(&"docs"));
+
+        let data = fs.read_file("greeting.txt", 0, 1024).unwrap();
+        assert_eq!(data, b"Hello from disk!");
+    }
+
+    std::fs::remove_file(&path).unwrap();
 }

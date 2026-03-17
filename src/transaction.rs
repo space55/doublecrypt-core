@@ -1,3 +1,5 @@
+use rand::RngCore;
+
 use crate::allocator::SlotAllocator;
 use crate::block_store::BlockStore;
 use crate::codec::{write_encrypted_object, ObjectCodec, PostcardCodec};
@@ -65,7 +67,14 @@ impl TransactionManager {
         let sb_block = allocator.allocate()?;
 
         // 2. Write encrypted superblock.
-        write_encrypted_object(store, crypto, codec, sb_block, ObjectKind::Superblock, superblock)?;
+        write_encrypted_object(
+            store,
+            crypto,
+            codec,
+            sb_block,
+            ObjectKind::Superblock,
+            superblock,
+        )?;
 
         // 3. Build root pointer with checksum.
         let sb_bytes = codec.serialize_object(superblock)?;
@@ -81,6 +90,7 @@ impl TransactionManager {
         let rp_bytes = codec.serialize_object(&root_ptr)?;
         let block_size = store.block_size();
         let mut block = vec![0u8; block_size];
+        rand::thread_rng().fill_bytes(&mut block);
         let len = rp_bytes.len() as u32;
         block[..4].copy_from_slice(&len.to_le_bytes());
         block[4..4 + rp_bytes.len()].copy_from_slice(&rp_bytes);

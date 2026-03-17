@@ -1,6 +1,8 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use rand::RngCore;
+
 use crate::allocator::{BitmapAllocator, SlotAllocator};
 use crate::block_store::BlockStore;
 use crate::codec::{
@@ -74,6 +76,7 @@ impl FilesystemCore {
         let header_bytes = self.codec.serialize_object(&header)?;
         let bs = self.store.block_size();
         let mut block = vec![0u8; bs];
+        rand::thread_rng().fill_bytes(&mut block);
         let len = header_bytes.len() as u32;
         block[..4].copy_from_slice(&len.to_le_bytes());
         block[4..4 + header_bytes.len()].copy_from_slice(&header_bytes);
@@ -173,7 +176,11 @@ impl FilesystemCore {
     /// For V1, only root directory is supported.
     pub fn create_file(&mut self, name: &str) -> FsResult<()> {
         self.validate_name(name)?;
-        let sb = self.superblock.as_ref().ok_or(FsError::NotInitialized)?.clone();
+        let sb = self
+            .superblock
+            .as_ref()
+            .ok_or(FsError::NotInitialized)?
+            .clone();
 
         // Load root inode and its directory page.
         let root_inode: Inode = self.read_obj(sb.root_inode_ref.block_id)?;
@@ -236,7 +243,11 @@ impl FilesystemCore {
     /// Write data to a file. For V1, this replaces the entire file content
     /// (single chunk only if it fits in one block).
     pub fn write_file(&mut self, name: &str, offset: u64, data: &[u8]) -> FsResult<()> {
-        let sb = self.superblock.as_ref().ok_or(FsError::NotInitialized)?.clone();
+        let sb = self
+            .superblock
+            .as_ref()
+            .ok_or(FsError::NotInitialized)?
+            .clone();
         let root_inode: Inode = self.read_obj(sb.root_inode_ref.block_id)?;
         let dir_page: DirectoryPage = self.read_obj(root_inode.directory_page_ref.block_id)?;
 
@@ -381,7 +392,11 @@ impl FilesystemCore {
     /// Create a subdirectory in the root directory.
     pub fn create_directory(&mut self, name: &str) -> FsResult<()> {
         self.validate_name(name)?;
-        let sb = self.superblock.as_ref().ok_or(FsError::NotInitialized)?.clone();
+        let sb = self
+            .superblock
+            .as_ref()
+            .ok_or(FsError::NotInitialized)?
+            .clone();
         let root_inode: Inode = self.read_obj(sb.root_inode_ref.block_id)?;
         let mut dir_page: DirectoryPage = self.read_obj(root_inode.directory_page_ref.block_id)?;
 
@@ -437,7 +452,11 @@ impl FilesystemCore {
 
     /// Remove a file from the root directory.
     pub fn remove_file(&mut self, name: &str) -> FsResult<()> {
-        let sb = self.superblock.as_ref().ok_or(FsError::NotInitialized)?.clone();
+        let sb = self
+            .superblock
+            .as_ref()
+            .ok_or(FsError::NotInitialized)?
+            .clone();
         let root_inode: Inode = self.read_obj(sb.root_inode_ref.block_id)?;
         let mut dir_page: DirectoryPage = self.read_obj(root_inode.directory_page_ref.block_id)?;
 
@@ -451,8 +470,7 @@ impl FilesystemCore {
         if entry.kind == InodeKind::Directory {
             // Check if directory is empty.
             let dir_inode: Inode = self.read_obj(entry.inode_ref.block_id)?;
-            let sub_page: DirectoryPage =
-                self.read_obj(dir_inode.directory_page_ref.block_id)?;
+            let sub_page: DirectoryPage = self.read_obj(dir_inode.directory_page_ref.block_id)?;
             if !sub_page.entries.is_empty() {
                 return Err(FsError::DirectoryNotEmpty(name.to_string()));
             }
@@ -483,7 +501,11 @@ impl FilesystemCore {
     /// Rename a file or directory within the root directory.
     pub fn rename(&mut self, old_name: &str, new_name: &str) -> FsResult<()> {
         self.validate_name(new_name)?;
-        let sb = self.superblock.as_ref().ok_or(FsError::NotInitialized)?.clone();
+        let sb = self
+            .superblock
+            .as_ref()
+            .ok_or(FsError::NotInitialized)?
+            .clone();
         let root_inode: Inode = self.read_obj(sb.root_inode_ref.block_id)?;
         let mut dir_page: DirectoryPage = self.read_obj(root_inode.directory_page_ref.block_id)?;
 
@@ -543,7 +565,12 @@ impl FilesystemCore {
     }
 
     fn read_obj<T: serde::de::DeserializeOwned>(&self, block_id: u64) -> FsResult<T> {
-        read_encrypted_object(self.store.as_ref(), self.crypto.as_ref(), &self.codec, block_id)
+        read_encrypted_object(
+            self.store.as_ref(),
+            self.crypto.as_ref(),
+            &self.codec,
+            block_id,
+        )
     }
 
     fn write_obj<T: serde::Serialize>(

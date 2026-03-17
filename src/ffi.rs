@@ -18,7 +18,7 @@ use std::os::raw::c_char;
 use std::ptr;
 use std::sync::Arc;
 
-use crate::block_store::MemoryBlockStore;
+use crate::block_store::{DiskBlockStore, MemoryBlockStore};
 use crate::crypto::ChaChaEngine;
 use crate::error::FsErrorCode;
 use crate::fs::FilesystemCore;
@@ -63,10 +63,72 @@ pub unsafe extern "C" fn fs_create(
     Box::into_raw(handle)
 }
 
+/// Create a filesystem handle backed by a file on disk.
+///
+/// `path`: null-terminated path to the image file.
+/// `total_blocks`: number of blocks. Pass 0 to infer from file size.
+/// `block_size`: block size in bytes. Pass 0 to use the default (65536).
+/// `create_new`: if nonzero, create a new file (fails if it already exists).
+///               if zero, open an existing file.
+/// `master_key`: pointer to the master encryption key bytes.
+/// `master_key_len`: length of master_key in bytes (should be 32).
+///
+/// Returns a pointer to an opaque handle, or null on failure.
+///
+/// # Safety
+/// - `path` must be a valid null-terminated C string.
+/// - `master_key` must point to `master_key_len` valid bytes.
+#[no_mangle]
+pub unsafe extern "C" fn fs_create_disk(
+    path: *const c_char,
+    total_blocks: u64,
+    block_size: u32,
+    create_new: i32,
+    master_key: *const u8,
+    master_key_len: usize,
+) -> *mut FsHandle {
+    if master_key.is_null() || master_key_len == 0 {
+        return ptr::null_mut();
+    }
+    let path_str = match unsafe { unsafe_cstr_to_str(path) } {
+        Some(s) => s,
+        None => return ptr::null_mut(),
+    };
+    let key_slice = unsafe { std::slice::from_raw_parts(master_key, master_key_len) };
+
+    let bs = if block_size == 0 {
+        DEFAULT_BLOCK_SIZE
+    } else {
+        block_size as usize
+    };
+
+    let store = if create_new != 0 {
+        match DiskBlockStore::create(path_str, bs, total_blocks) {
+            Ok(s) => Arc::new(s),
+            Err(_) => return ptr::null_mut(),
+        }
+    } else {
+        match DiskBlockStore::open(path_str, bs, total_blocks) {
+            Ok(s) => Arc::new(s),
+            Err(_) => return ptr::null_mut(),
+        }
+    };
+
+    let crypto = match ChaChaEngine::new(key_slice) {
+        Ok(c) => Arc::new(c),
+        Err(_) => return ptr::null_mut(),
+    };
+
+    let core = FilesystemCore::new(store, crypto);
+    let handle = Box::new(FsHandle { core });
+    Box::into_raw(handle)
+}
+
 /// Destroy a filesystem handle and free all associated resources.
 ///
 /// # Safety
-/// `handle` must be a valid pointer returned by `fs_create`, and must not be used after this call.
+/// `handle` must be a valid pointer returned by `fs_create` or `fs_create_disk`,
+/// and must not be used after this call.
 #[no_mangle]
 pub unsafe extern "C" fn fs_destroy(handle: *mut FsHandle) {
     if !handle.is_null() {
@@ -207,10 +269,7 @@ pub unsafe extern "C" fn fs_read_file(
 /// - `handle` must be a valid pointer.
 /// - `out_error` must be a valid pointer (or null if the caller doesn't need the error code).
 #[no_mangle]
-pub unsafe extern "C" fn fs_list_root(
-    handle: *mut FsHandle,
-    out_error: *mut i32,
-) -> *mut c_char {
+pub unsafe extern "C" fn fs_list_root(handle: *mut FsHandle, out_error: *mut i32) -> *mut c_char {
     let Some(h) = (unsafe { handle.as_mut() }) else {
         if !out_error.is_null() {
             unsafe { *out_error = FsErrorCode::InvalidArgument as i32 };
