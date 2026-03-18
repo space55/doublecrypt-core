@@ -191,6 +191,7 @@ fn test_reopen_filesystem() {
         fs.write_file("persist.txt", 0, b"I survived a reopen!")
             .unwrap();
         fs.create_directory("mydir").unwrap();
+        fs.sync().unwrap();
     }
 
     // Second session: open from the same store.
@@ -210,6 +211,7 @@ fn test_reopen_filesystem() {
 
         let entries = fs.list_directory("").unwrap();
         assert_eq!(entries.len(), 3);
+        fs.sync().unwrap();
     }
 
     // Third session: verify again.
@@ -251,7 +253,7 @@ fn test_empty_file_read() {
 
 #[test]
 fn test_sync_does_not_error() {
-    let (fs, _, _) = make_fs();
+    let (mut fs, _, _) = make_fs();
     fs.sync().unwrap();
 }
 

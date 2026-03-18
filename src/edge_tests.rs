@@ -503,6 +503,7 @@ fn test_reopen_after_many_mutations() {
             let new = format!("renamed_{i}");
             fs.rename(&old, &new).unwrap();
         }
+        fs.sync().unwrap();
     }
 
     // Reopen.
@@ -548,6 +549,7 @@ fn test_reopen_preserves_file_sizes() {
                 fs.write_file(&name, 0, &data).unwrap();
             }
         }
+        fs.sync().unwrap();
     }
 
     let mut fs = FilesystemCore::new(store, crypto);

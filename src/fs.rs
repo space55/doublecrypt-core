@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -30,6 +31,8 @@ pub struct FilesystemCore {
     superblock: Option<Superblock>,
     /// Next inode ID to allocate.
     next_inode_id: InodeId,
+    /// Write buffer: dirty file chunks held in memory until flush.
+    write_buffer: HashMap<String, DirtyFile>,
 }
 
 /// Tracks one ancestor directory during path resolution, used by
@@ -38,6 +41,24 @@ struct AncestorEntry {
     inode: Inode,
     dir_page: DirectoryPage,
     child_index: usize,
+}
+
+/// Default write buffer limit before auto-flush (16 MiB).
+const WRITE_BUFFER_LIMIT: usize = 16 * 1024 * 1024;
+
+/// Tracks in-memory buffered writes for a single file.
+/// Dirty chunks are held in memory and flushed to the block store
+/// on `sync()`, when another metadata operation occurs, or when the
+/// total buffer size exceeds `WRITE_BUFFER_LIMIT`.
+struct DirtyFile {
+    /// In-memory chunk data keyed by chunk index.
+    dirty_chunks: HashMap<u64, Vec<u8>>,
+    /// The file's inode at the time buffering started.
+    base_inode: Inode,
+    /// The file's extent map (disk snapshot; updated with new entries on flush).
+    extent_map: ExtentMap,
+    /// Current logical file size (updated on every write).
+    size: u64,
 }
 
 /// Maximum payload size for a single file data chunk.
@@ -72,6 +93,7 @@ impl FilesystemCore {
             txn: TransactionManager::new(),
             superblock: None,
             next_inode_id: 1,
+            write_buffer: HashMap::new(),
         }
     }
 
@@ -309,6 +331,7 @@ impl FilesystemCore {
     pub fn create_file(&mut self, path: &str) -> FsResult<()> {
         let (dir_parts, leaf) = Self::split_path(path)?;
         self.validate_name(leaf)?;
+        self.flush_all()?;
         let sb = self
             .superblock
             .as_ref()
@@ -356,56 +379,58 @@ impl FilesystemCore {
 
     /// Write data to a file at the given path.
     ///
-    /// Only the chunks that overlap with `[offset, offset+data.len())` are
-    /// read and rewritten.  For sequential appends this means O(new_data)
-    /// work instead of O(file_size).
+    /// Writes are buffered in memory and only flushed to the block store on
+    /// `sync()`, when another metadata operation occurs, or when the total
+    /// buffer exceeds ~16 MiB.  This turns many small sequential writes
+    /// (e.g. `dd bs=1k`) into a single bulk commit.
     pub fn write_file(&mut self, path: &str, offset: u64, data: &[u8]) -> FsResult<()> {
-        let (dir_parts, leaf) = Self::split_path(path)?;
-        let sb = self
-            .superblock
-            .as_ref()
-            .ok_or(FsError::NotInitialized)?
-            .clone();
-        let root_inode: Inode = self.read_obj(sb.root_inode_ref.block_id)?;
-        let (ancestors, target_inode, dir_page) =
-            self.resolve_dir_chain(&dir_parts, &root_inode)?;
-
-        let entry = dir_page
-            .entries
-            .iter()
-            .find(|e| e.name == leaf)
-            .ok_or_else(|| FsError::FileNotFound(leaf.to_string()))?;
-
-        if entry.kind != InodeKind::File {
-            return Err(FsError::NotAFile(leaf.to_string()));
+        if data.is_empty() {
+            return Ok(());
         }
-
-        let file_inode: Inode = self.read_obj(entry.inode_ref.block_id)?;
-        let mut extent_map: ExtentMap = self.read_obj(file_inode.extent_map_ref.block_id)?;
 
         let chunk_size = max_chunk_payload(self.store.block_size());
         if chunk_size == 0 {
             return Err(FsError::DataTooLarge(data.len()));
         }
 
-        if data.is_empty() {
-            return Ok(());
-        }
+        let path_key = path.trim_matches('/').to_string();
 
-        let old_size = file_inode.size as usize;
+        // Take the dirty entry out of the map so `self` is free for other
+        // borrows (disk reads, etc.).  We'll put it back at the end.
+        let mut dirty = match self.write_buffer.remove(&path_key) {
+            Some(d) => d,
+            None => {
+                // First buffered write — load metadata from disk.
+                let (dir_parts, leaf) = Self::split_path(path)?;
+                let sb = self.superblock.as_ref().ok_or(FsError::NotInitialized)?;
+                let root_inode: Inode = self.read_obj(sb.root_inode_ref.block_id)?;
+                let (_, _, dir_page) = self.resolve_dir_chain(&dir_parts, &root_inode)?;
+                let entry = dir_page
+                    .entries
+                    .iter()
+                    .find(|e| e.name == leaf)
+                    .ok_or_else(|| FsError::FileNotFound(leaf.to_string()))?;
+                if entry.kind != InodeKind::File {
+                    return Err(FsError::NotAFile(leaf.to_string()));
+                }
+                let file_inode: Inode = self.read_obj(entry.inode_ref.block_id)?;
+                let mut extent_map: ExtentMap =
+                    self.read_obj(file_inode.extent_map_ref.block_id)?;
+                extent_map.entries.sort_by_key(|e| e.chunk_index);
+                DirtyFile {
+                    dirty_chunks: HashMap::new(),
+                    base_inode: file_inode.clone(),
+                    extent_map,
+                    size: file_inode.size,
+                }
+            }
+        };
+
+        let old_size = dirty.size as usize;
         let write_start = offset as usize;
         let write_end = write_start + data.len();
         let new_size = std::cmp::max(old_size, write_end);
 
-        // Sort existing entries so we can binary-search by chunk_index.
-        extent_map.entries.sort_by_key(|e| e.chunk_index);
-        // Remember the sorted portion length — new entries are appended
-        // after this and are NOT included in binary searches.
-        let sorted_len = extent_map.entries.len();
-
-        // Determine which chunk indices need writing.
-        // For appends past the current end we also need to extend or
-        // zero-fill from the last partial chunk onward.
         let first_chunk = if write_start >= old_size {
             old_size / chunk_size
         } else {
@@ -417,26 +442,35 @@ impl FilesystemCore {
             let chunk_file_start = chunk_idx * chunk_size;
             let chunk_file_end = std::cmp::min(chunk_file_start + chunk_size, new_size);
             let chunk_len = chunk_file_end - chunk_file_start;
-
-            let mut chunk_buf = vec![0u8; chunk_len];
-
-            // Copy existing data for this chunk if it already exists on disk.
             let chunk_idx_u64 = chunk_idx as u64;
-            if chunk_file_start < old_size {
-                if let Ok(pos) = extent_map.entries[..sorted_len]
-                    .binary_search_by_key(&chunk_idx_u64, |e| e.chunk_index)
-                {
-                    let existing = &extent_map.entries[pos];
-                    let raw = read_encrypted_raw(
-                        self.store.as_ref(),
-                        self.crypto.as_ref(),
-                        &self.codec,
-                        existing.data_ref.block_id,
-                    )?;
-                    let copy_len = std::cmp::min(existing.plaintext_len as usize, chunk_len);
-                    let src_len = std::cmp::min(copy_len, raw.len());
-                    chunk_buf[..src_len].copy_from_slice(&raw[..src_len]);
+
+            // If this chunk isn't buffered yet, load its on-disk content (or zeros).
+            if !dirty.dirty_chunks.contains_key(&chunk_idx_u64) {
+                let mut buf = vec![0u8; chunk_len];
+                if chunk_file_start < old_size {
+                    if let Ok(pos) = dirty
+                        .extent_map
+                        .entries
+                        .binary_search_by_key(&chunk_idx_u64, |e| e.chunk_index)
+                    {
+                        let existing = &dirty.extent_map.entries[pos];
+                        let raw = read_encrypted_raw(
+                            self.store.as_ref(),
+                            self.crypto.as_ref(),
+                            &self.codec,
+                            existing.data_ref.block_id,
+                        )?;
+                        let copy_len = std::cmp::min(existing.plaintext_len as usize, chunk_len);
+                        let src_len = std::cmp::min(copy_len, raw.len());
+                        buf[..src_len].copy_from_slice(&raw[..src_len]);
+                    }
                 }
+                dirty.dirty_chunks.insert(chunk_idx_u64, buf);
+            }
+
+            let chunk_buf = dirty.dirty_chunks.get_mut(&chunk_idx_u64).unwrap();
+            if chunk_buf.len() < chunk_len {
+                chunk_buf.resize(chunk_len, 0);
             }
 
             // Overlay the write data onto the chunk.
@@ -449,62 +483,36 @@ impl FilesystemCore {
                 chunk_buf[chunk_off..chunk_off + len]
                     .copy_from_slice(&data[data_off..data_off + len]);
             }
-
-            // Write the (possibly new) chunk.
-            let data_block = self.allocator.allocate()?;
-            write_encrypted_raw(
-                self.store.as_ref(),
-                self.crypto.as_ref(),
-                &self.codec,
-                data_block,
-                ObjectKind::FileDataChunk,
-                &chunk_buf,
-            )?;
-
-            // Update existing extent entry or append a new one.
-            if let Ok(pos) = extent_map.entries[..sorted_len]
-                .binary_search_by_key(&chunk_idx_u64, |e| e.chunk_index)
-            {
-                extent_map.entries[pos].data_ref = ObjectRef::new(data_block);
-                extent_map.entries[pos].plaintext_len = chunk_buf.len() as u32;
-            } else {
-                extent_map.entries.push(ExtentEntry {
-                    chunk_index: chunk_idx_u64,
-                    data_ref: ObjectRef::new(data_block),
-                    plaintext_len: chunk_buf.len() as u32,
-                });
-            }
         }
 
-        // Re-sort after potential appends.
-        extent_map.entries.sort_by_key(|e| e.chunk_index);
+        dirty.size = new_size as u64;
+        self.write_buffer.insert(path_key, dirty);
 
-        // Write updated extent map (CoW).
-        let new_em_block = self.allocator.allocate()?;
-        self.write_obj(new_em_block, ObjectKind::ExtentMap, &extent_map)?;
-
-        // Write updated file inode.
-        let mut new_file_inode = file_inode.clone();
-        new_file_inode.size = new_size as u64;
-        new_file_inode.extent_map_ref = ObjectRef::new(new_em_block);
-        new_file_inode.modified_at = now_secs();
-        let new_inode_block = self.allocator.allocate()?;
-        self.write_obj(new_inode_block, ObjectKind::Inode, &new_file_inode)?;
-
-        // Update directory entry to point to new inode block.
-        let mut new_dir_page = dir_page.clone();
-        for e in &mut new_dir_page.entries {
-            if e.name == leaf {
-                e.inode_ref = ObjectRef::new(new_inode_block);
-            }
+        // Auto-flush if total buffered data exceeds the threshold.
+        let total_buffered: usize = self
+            .write_buffer
+            .values()
+            .flat_map(|d| d.dirty_chunks.values())
+            .map(|v| v.len())
+            .sum();
+        if total_buffered > WRITE_BUFFER_LIMIT {
+            self.flush_all()?;
         }
 
-        self.commit_cow_chain(&sb, &ancestors, &target_inode, &new_dir_page)?;
         Ok(())
     }
 
     /// Read file data at the given path. Returns the requested slice.
+    ///
+    /// If the file has buffered (unflushed) writes, reads are served from the
+    /// in-memory buffer merged with on-disk data.
     pub fn read_file(&self, path: &str, offset: u64, len: usize) -> FsResult<Vec<u8>> {
+        let path_key = path.trim_matches('/');
+
+        if let Some(dirty) = self.write_buffer.get(path_key) {
+            return self.read_file_buffered(dirty, offset, len);
+        }
+
         let (dir_parts, leaf) = Self::split_path(path)?;
         let sb = self.superblock.as_ref().ok_or(FsError::NotInitialized)?;
         let root_inode: Inode = self.read_obj(sb.root_inode_ref.block_id)?;
@@ -543,13 +551,33 @@ impl FilesystemCore {
         let components = Self::split_dir_path(path);
         let (_, _, dir_page) = self.resolve_dir_chain(&components, &root_inode)?;
 
+        let dir_prefix = {
+            let trimmed = path.trim_matches('/');
+            if trimmed.is_empty() {
+                String::new()
+            } else {
+                format!("{}/", trimmed)
+            }
+        };
+
         let mut result = Vec::new();
         for entry in &dir_page.entries {
             let inode: Inode = self.read_obj(entry.inode_ref.block_id)?;
+            // Use buffered size if this file has pending writes.
+            let size = if entry.kind == InodeKind::File {
+                let full_path = format!("{}{}", dir_prefix, entry.name);
+                if let Some(dirty) = self.write_buffer.get(&full_path) {
+                    dirty.size
+                } else {
+                    inode.size
+                }
+            } else {
+                inode.size
+            };
             result.push(DirListEntry {
                 name: entry.name.clone(),
                 kind: entry.kind,
-                size: inode.size,
+                size,
                 inode_id: entry.inode_id,
             });
         }
@@ -562,6 +590,7 @@ impl FilesystemCore {
     pub fn create_directory(&mut self, path: &str) -> FsResult<()> {
         let (dir_parts, leaf) = Self::split_path(path)?;
         self.validate_name(leaf)?;
+        self.flush_all()?;
         let sb = self
             .superblock
             .as_ref()
@@ -607,6 +636,9 @@ impl FilesystemCore {
 
     /// Remove a file or empty directory at the given path.
     pub fn remove_file(&mut self, path: &str) -> FsResult<()> {
+        let path_key = path.trim_matches('/').to_string();
+        self.write_buffer.remove(&path_key);
+        self.flush_all()?;
         let (dir_parts, leaf) = Self::split_path(path)?;
         let sb = self
             .superblock
@@ -643,6 +675,7 @@ impl FilesystemCore {
         let (old_dir, old_leaf) = Self::split_path(old_path)?;
         let (new_dir, new_leaf) = Self::split_path(new_path)?;
         self.validate_name(new_leaf)?;
+        self.flush_all()?;
 
         if old_dir != new_dir {
             return Err(FsError::Internal(
@@ -675,12 +708,163 @@ impl FilesystemCore {
         Ok(())
     }
 
-    /// Sync / flush. Calls through to the block store sync.
-    pub fn sync(&self) -> FsResult<()> {
+    /// Sync / flush. Writes all buffered data to blocks and calls through
+    /// to the block store sync.
+    pub fn sync(&mut self) -> FsResult<()> {
+        self.flush_all()?;
         self.store.sync()
     }
 
     // ── Internal helpers ──
+
+    /// Flush a single file's buffered writes to the block store.
+    fn flush_file(&mut self, path_key: &str) -> FsResult<()> {
+        let dirty = match self.write_buffer.remove(path_key) {
+            Some(d) => d,
+            None => return Ok(()),
+        };
+
+        if dirty.dirty_chunks.is_empty() {
+            return Ok(());
+        }
+
+        // Re-resolve path from the current superblock.
+        let (dir_parts, leaf) = Self::split_path(path_key)?;
+        let sb = self
+            .superblock
+            .as_ref()
+            .ok_or(FsError::NotInitialized)?
+            .clone();
+        let root_inode: Inode = self.read_obj(sb.root_inode_ref.block_id)?;
+        let (ancestors, target_inode, dir_page) =
+            self.resolve_dir_chain(&dir_parts, &root_inode)?;
+
+        let mut extent_map = dirty.extent_map;
+
+        // Write each dirty chunk to a new block.
+        for (&chunk_idx, chunk_data) in &dirty.dirty_chunks {
+            let data_block = self.allocator.allocate()?;
+            write_encrypted_raw(
+                self.store.as_ref(),
+                self.crypto.as_ref(),
+                &self.codec,
+                data_block,
+                ObjectKind::FileDataChunk,
+                chunk_data,
+            )?;
+
+            if let Some(entry) = extent_map
+                .entries
+                .iter_mut()
+                .find(|e| e.chunk_index == chunk_idx)
+            {
+                entry.data_ref = ObjectRef::new(data_block);
+                entry.plaintext_len = chunk_data.len() as u32;
+            } else {
+                extent_map.entries.push(ExtentEntry {
+                    chunk_index: chunk_idx,
+                    data_ref: ObjectRef::new(data_block),
+                    plaintext_len: chunk_data.len() as u32,
+                });
+            }
+        }
+
+        extent_map.entries.sort_by_key(|e| e.chunk_index);
+
+        // Write extent map.
+        let new_em_block = self.allocator.allocate()?;
+        self.write_obj(new_em_block, ObjectKind::ExtentMap, &extent_map)?;
+
+        // Write inode.
+        let mut new_inode = dirty.base_inode;
+        new_inode.size = dirty.size;
+        new_inode.extent_map_ref = ObjectRef::new(new_em_block);
+        new_inode.modified_at = now_secs();
+        let new_inode_block = self.allocator.allocate()?;
+        self.write_obj(new_inode_block, ObjectKind::Inode, &new_inode)?;
+
+        // Update dir entry.
+        let mut new_dir_page = dir_page.clone();
+        for e in &mut new_dir_page.entries {
+            if e.name == leaf {
+                e.inode_ref = ObjectRef::new(new_inode_block);
+            }
+        }
+
+        self.commit_cow_chain(&sb, &ancestors, &target_inode, &new_dir_page)?;
+        Ok(())
+    }
+
+    /// Flush all buffered file writes to the block store.
+    fn flush_all(&mut self) -> FsResult<()> {
+        let keys: Vec<String> = self.write_buffer.keys().cloned().collect();
+        for key in keys {
+            self.flush_file(&key)?;
+        }
+        Ok(())
+    }
+
+    /// Read from a file that has dirty (buffered) chunks, merging in-memory
+    /// data with on-disk data.
+    fn read_file_buffered(&self, dirty: &DirtyFile, offset: u64, len: usize) -> FsResult<Vec<u8>> {
+        let chunk_size = max_chunk_payload(self.store.block_size());
+        let file_size = dirty.size as usize;
+        let start = offset as usize;
+        if start >= file_size || len == 0 {
+            return Ok(Vec::new());
+        }
+        let end = std::cmp::min(start + len, file_size);
+        let mut result = Vec::with_capacity(end - start);
+
+        let first_chunk = start / chunk_size;
+        let last_chunk = (end - 1) / chunk_size;
+
+        for chunk_idx in first_chunk..=last_chunk {
+            let chunk_file_start = chunk_idx * chunk_size;
+            let chunk_file_end = std::cmp::min(chunk_file_start + chunk_size, file_size);
+            let chunk_idx_u64 = chunk_idx as u64;
+
+            // Get chunk data from buffer or disk.
+            let chunk_data: Vec<u8> = if let Some(buf) = dirty.dirty_chunks.get(&chunk_idx_u64) {
+                buf.clone()
+            } else if let Ok(pos) = dirty
+                .extent_map
+                .entries
+                .binary_search_by_key(&chunk_idx_u64, |e| e.chunk_index)
+            {
+                let entry = &dirty.extent_map.entries[pos];
+                let raw = read_encrypted_raw(
+                    self.store.as_ref(),
+                    self.crypto.as_ref(),
+                    &self.codec,
+                    entry.data_ref.block_id,
+                )?;
+                let plain_len = std::cmp::min(entry.plaintext_len as usize, raw.len());
+                raw[..plain_len].to_vec()
+            } else {
+                vec![0u8; chunk_file_end - chunk_file_start]
+            };
+
+            // Slice to the requested range within this chunk.
+            let read_start = if chunk_idx == first_chunk {
+                start - chunk_file_start
+            } else {
+                0
+            };
+            let read_end = if chunk_idx == last_chunk {
+                end - chunk_file_start
+            } else {
+                chunk_data.len()
+            };
+            let read_end = std::cmp::min(read_end, chunk_data.len());
+
+            if read_start < read_end {
+                result.extend_from_slice(&chunk_data[read_start..read_end]);
+            }
+        }
+
+        Ok(result)
+    }
 
     fn alloc_inode_id(&mut self) -> InodeId {
         let id = self.next_inode_id;
