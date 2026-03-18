@@ -506,3 +506,115 @@ fn test_nested_cow_preserves_sibling() {
     assert_eq!(a, b"AAA");
     assert_eq!(b, b"bbb");
 }
+
+// ── Write performance / correctness tests ──
+
+/// Simulate `dd bs=1M count=N`: sequential 1 MiB appends.
+/// Verify the data roundtrips correctly and that per-write block
+/// allocation is bounded (not O(file_size)).
+#[test]
+fn test_sequential_append_does_not_degrade() {
+    // Use a large store so we don't run out of blocks.
+    let store = Arc::new(MemoryBlockStore::new(DEFAULT_BLOCK_SIZE, 8192));
+    let crypto = Arc::new(ChaChaEngine::generate().unwrap());
+    let mut fs = FilesystemCore::new(store.clone(), crypto.clone());
+    fs.init_filesystem().unwrap();
+
+    fs.create_file("big.bin").unwrap();
+
+    let write_size: usize = 256 * 1024; // 256 KiB per write
+    let num_writes = 20;
+    let pattern = vec![0xABu8; write_size];
+
+    let mut alloc_counts: Vec<u64> = Vec::new();
+    for i in 0..num_writes {
+        let before = store.stats_writes();
+        fs.write_file("big.bin", (i * write_size) as u64, &pattern)
+            .unwrap();
+        let after = store.stats_writes();
+        alloc_counts.push(after - before);
+    }
+
+    // Verify data integrity: spot-check first and last writes.
+    let first = fs.read_file("big.bin", 0, write_size).unwrap();
+    assert_eq!(first.len(), write_size);
+    assert!(first.iter().all(|&b| b == 0xAB));
+
+    let last_offset = ((num_writes - 1) * write_size) as u64;
+    let last = fs.read_file("big.bin", last_offset, write_size).unwrap();
+    assert_eq!(last.len(), write_size);
+    assert!(last.iter().all(|&b| b == 0xAB));
+
+    // The key invariant: later writes should NOT do more block writes
+    // than early ones.  Allow 2x tolerance for metadata overhead.
+    let first_cost = alloc_counts[0];
+    let last_cost = *alloc_counts.last().unwrap();
+    assert!(
+        last_cost <= first_cost * 2,
+        "last write cost ({last_cost}) is more than 2× first ({first_cost}); \
+         write is still O(n): {:?}",
+        alloc_counts
+    );
+}
+
+/// Overwrite a range in the middle of a file — only the affected chunks
+/// should be rewritten, not the entire file.
+#[test]
+fn test_mid_file_overwrite_is_bounded() {
+    let store = Arc::new(MemoryBlockStore::new(DEFAULT_BLOCK_SIZE, 4096));
+    let crypto = Arc::new(ChaChaEngine::generate().unwrap());
+    let mut fs = FilesystemCore::new(store.clone(), crypto.clone());
+    fs.init_filesystem().unwrap();
+
+    fs.create_file("data.bin").unwrap();
+
+    // Write 1 MiB of 0xFF.
+    let mb = vec![0xFFu8; 1024 * 1024];
+    fs.write_file("data.bin", 0, &mb).unwrap();
+
+    // Overwrite 4 KiB in the middle.
+    let patch = vec![0x42u8; 4096];
+    let before = store.stats_writes();
+    fs.write_file("data.bin", 512 * 1024, &patch).unwrap();
+    let after = store.stats_writes();
+
+    // Should only rewrite a few data chunks + metadata, not all ~16 data chunks.
+    // Old approach would be 16+ data rewrites + metadata ≈ 22+.
+    let writes = after - before;
+    assert!(
+        writes < 16,
+        "mid-file 4 KiB overwrite caused {writes} block writes; expected < 16"
+    );
+
+    // Verify the patch landed correctly.
+    let read_back = fs.read_file("data.bin", 512 * 1024, 4096).unwrap();
+    assert_eq!(read_back, patch);
+
+    // Verify surrounding data is unchanged.
+    let before_patch = fs.read_file("data.bin", 512 * 1024 - 16, 16).unwrap();
+    assert!(before_patch.iter().all(|&b| b == 0xFF));
+    let after_patch = fs.read_file("data.bin", 512 * 1024 + 4096, 16).unwrap();
+    assert!(after_patch.iter().all(|&b| b == 0xFF));
+}
+
+/// Write at a high offset creating a gap — the gap should be zero-filled
+/// and surrounding data correct.
+#[test]
+fn test_write_with_gap_fills_zeros() {
+    let (mut fs, _, _) = make_fs();
+    fs.create_file("sparse.bin").unwrap();
+    fs.write_file("sparse.bin", 0, b"HEAD").unwrap();
+
+    // Write far past the current end.
+    fs.write_file("sparse.bin", 200_000, b"TAIL").unwrap();
+
+    let head = fs.read_file("sparse.bin", 0, 4).unwrap();
+    assert_eq!(head, b"HEAD");
+
+    // Gap should be zeros.
+    let gap = fs.read_file("sparse.bin", 4, 1000).unwrap();
+    assert!(gap.iter().all(|&b| b == 0), "gap should be zero-filled");
+
+    let tail = fs.read_file("sparse.bin", 200_000, 4).unwrap();
+    assert_eq!(tail, b"TAIL");
+}

@@ -51,6 +51,8 @@ pub struct MemoryBlockStore {
     block_size: usize,
     total_blocks: u64,
     blocks: Mutex<HashMap<u64, Vec<u8>>>,
+    /// Counter incremented on every `write_block` call (for perf testing).
+    write_count: std::sync::atomic::AtomicU64,
 }
 
 impl MemoryBlockStore {
@@ -59,7 +61,13 @@ impl MemoryBlockStore {
             block_size,
             total_blocks,
             blocks: Mutex::new(HashMap::new()),
+            write_count: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// Return the total number of `write_block` calls made so far.
+    pub fn stats_writes(&self) -> u64 {
+        self.write_count.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -99,6 +107,8 @@ impl BlockStore for MemoryBlockStore {
                 got: data.len(),
             });
         }
+        self.write_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut blocks = self
             .blocks
             .lock()

@@ -355,6 +355,10 @@ impl FilesystemCore {
     }
 
     /// Write data to a file at the given path.
+    ///
+    /// Only the chunks that overlap with `[offset, offset+data.len())` are
+    /// read and rewritten.  For sequential appends this means O(new_data)
+    /// work instead of O(file_size).
     pub fn write_file(&mut self, path: &str, offset: u64, data: &[u8]) -> FsResult<()> {
         let (dir_parts, leaf) = Self::split_path(path)?;
         let sb = self
@@ -379,26 +383,74 @@ impl FilesystemCore {
         let file_inode: Inode = self.read_obj(entry.inode_ref.block_id)?;
         let mut extent_map: ExtentMap = self.read_obj(file_inode.extent_map_ref.block_id)?;
 
-        // V1: support write-at-offset by building a full buffer.
-        // Read existing data (if any) and splice in the new data.
-        let mut buf = self.read_all_chunks(&extent_map)?;
-
-        let end = offset as usize + data.len();
-        if end > buf.len() {
-            buf.resize(end, 0);
-        }
-        buf[offset as usize..end].copy_from_slice(data);
-
-        let total_size = buf.len();
-
-        // Re-chunk the data. Each chunk must fit in max_chunk_payload.
         let chunk_size = max_chunk_payload(self.store.block_size());
         if chunk_size == 0 {
-            return Err(FsError::DataTooLarge(total_size));
+            return Err(FsError::DataTooLarge(data.len()));
         }
 
-        let mut new_entries = Vec::new();
-        for (i, chunk_data) in buf.chunks(chunk_size).enumerate() {
+        if data.is_empty() {
+            return Ok(());
+        }
+
+        let old_size = file_inode.size as usize;
+        let write_start = offset as usize;
+        let write_end = write_start + data.len();
+        let new_size = std::cmp::max(old_size, write_end);
+
+        // Sort existing entries so we can binary-search by chunk_index.
+        extent_map.entries.sort_by_key(|e| e.chunk_index);
+        // Remember the sorted portion length — new entries are appended
+        // after this and are NOT included in binary searches.
+        let sorted_len = extent_map.entries.len();
+
+        // Determine which chunk indices need writing.
+        // For appends past the current end we also need to extend or
+        // zero-fill from the last partial chunk onward.
+        let first_chunk = if write_start >= old_size {
+            old_size / chunk_size
+        } else {
+            write_start / chunk_size
+        };
+        let last_chunk = (new_size - 1) / chunk_size;
+
+        for chunk_idx in first_chunk..=last_chunk {
+            let chunk_file_start = chunk_idx * chunk_size;
+            let chunk_file_end = std::cmp::min(chunk_file_start + chunk_size, new_size);
+            let chunk_len = chunk_file_end - chunk_file_start;
+
+            let mut chunk_buf = vec![0u8; chunk_len];
+
+            // Copy existing data for this chunk if it already exists on disk.
+            let chunk_idx_u64 = chunk_idx as u64;
+            if chunk_file_start < old_size {
+                if let Ok(pos) = extent_map.entries[..sorted_len]
+                    .binary_search_by_key(&chunk_idx_u64, |e| e.chunk_index)
+                {
+                    let existing = &extent_map.entries[pos];
+                    let raw = read_encrypted_raw(
+                        self.store.as_ref(),
+                        self.crypto.as_ref(),
+                        &self.codec,
+                        existing.data_ref.block_id,
+                    )?;
+                    let copy_len = std::cmp::min(existing.plaintext_len as usize, chunk_len);
+                    let src_len = std::cmp::min(copy_len, raw.len());
+                    chunk_buf[..src_len].copy_from_slice(&raw[..src_len]);
+                }
+            }
+
+            // Overlay the write data onto the chunk.
+            let overlap_start = std::cmp::max(chunk_file_start, write_start);
+            let overlap_end = std::cmp::min(chunk_file_end, write_end);
+            if overlap_start < overlap_end {
+                let data_off = overlap_start - write_start;
+                let chunk_off = overlap_start - chunk_file_start;
+                let len = overlap_end - overlap_start;
+                chunk_buf[chunk_off..chunk_off + len]
+                    .copy_from_slice(&data[data_off..data_off + len]);
+            }
+
+            // Write the (possibly new) chunk.
             let data_block = self.allocator.allocate()?;
             write_encrypted_raw(
                 self.store.as_ref(),
@@ -406,17 +458,26 @@ impl FilesystemCore {
                 &self.codec,
                 data_block,
                 ObjectKind::FileDataChunk,
-                chunk_data,
+                &chunk_buf,
             )?;
-            new_entries.push(ExtentEntry {
-                chunk_index: i as u64,
-                data_ref: ObjectRef::new(data_block),
-                plaintext_len: chunk_data.len() as u32,
-            });
+
+            // Update existing extent entry or append a new one.
+            if let Ok(pos) = extent_map.entries[..sorted_len]
+                .binary_search_by_key(&chunk_idx_u64, |e| e.chunk_index)
+            {
+                extent_map.entries[pos].data_ref = ObjectRef::new(data_block);
+                extent_map.entries[pos].plaintext_len = chunk_buf.len() as u32;
+            } else {
+                extent_map.entries.push(ExtentEntry {
+                    chunk_index: chunk_idx_u64,
+                    data_ref: ObjectRef::new(data_block),
+                    plaintext_len: chunk_buf.len() as u32,
+                });
+            }
         }
 
-        // TODO: free old data blocks (deferred GC).
-        extent_map.entries = new_entries;
+        // Re-sort after potential appends.
+        extent_map.entries.sort_by_key(|e| e.chunk_index);
 
         // Write updated extent map (CoW).
         let new_em_block = self.allocator.allocate()?;
@@ -424,7 +485,7 @@ impl FilesystemCore {
 
         // Write updated file inode.
         let mut new_file_inode = file_inode.clone();
-        new_file_inode.size = total_size as u64;
+        new_file_inode.size = new_size as u64;
         new_file_inode.extent_map_ref = ObjectRef::new(new_em_block);
         new_file_inode.modified_at = now_secs();
         let new_inode_block = self.allocator.allocate()?;
