@@ -6,7 +6,10 @@
 //!
 //! # Architecture
 //!
-//! - [`block_store`] – Block store trait and in-memory implementation
+//! - [`block_store`] – Block store trait and local implementations
+//! - [`cached_store`] – Write-back LRU cache for any `BlockStore`
+//! - [`proto`] – Shared protobuf types for the block-store wire protocol
+//! - [`network_store`] – mTLS network-backed block store *(feature: `network`)*
 //! - [`allocator`] – Slot/block allocator
 //! - [`crypto`] – AEAD encryption engine (ChaCha20-Poly1305)
 //! - [`codec`] – Object serialization/encryption helpers
@@ -18,6 +21,7 @@
 
 pub mod allocator;
 pub mod block_store;
+pub mod cached_store;
 pub mod codec;
 pub mod crypto;
 pub mod error;
@@ -25,6 +29,10 @@ pub mod ffi;
 pub mod fs;
 pub mod model;
 pub mod transaction;
+
+#[cfg(feature = "network")]
+pub mod network_store;
+pub mod proto;
 
 #[cfg(test)]
 mod tests;

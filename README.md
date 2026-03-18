@@ -1,8 +1,8 @@
 # doublecrypt-core
 
-A minimal encrypted filesystem core in Rust. All data at rest is encrypted with ChaCha20-Poly1305 AEAD; the backing block store sees only opaque ciphertext. Designed for embedding in desktop and mobile apps via a C ABI (Swift, Kotlin/JNI, etc.).
+A minimal encrypted filesystem core in Rust. All data at rest is encrypted with ChaCha20-Poly1305 AEAD; the backing block store sees only opaque ciphertext. Designed for embedding in desktop and mobile apps via a C ABI (Swift, Kotlin/JNI, etc.) and for use in Rust-based Linux FUSE mounts.
 
-Supports three storage backends: in-memory (for testing), regular files (disk images), and raw block devices (e.g. AWS EBS volumes mounted on EC2 instances).
+Supports five storage backends: in-memory (for testing), regular files (disk images), raw block devices (e.g. AWS EBS volumes), and **network-backed storage** via mTLS to a [`doublecrypt-server`](https://github.com/doublecrypt/doublecrypt-server) — with an optional write-back LRU cache layer that can sit in front of any backend.
 
 ## Quick Start
 
@@ -36,26 +36,32 @@ assert_eq!(data, b"Hello, encrypted world!");
 The crate is organized as a layered stack. Each layer depends only on the ones below it.
 
 ```
-┌─────────────────────────────────────┐
-│  ffi            C ABI for Swift/etc │
-├─────────────────────────────────────┤
-│  fs             FilesystemCore      │
-├─────────────────────────────────────┤
-│  transaction    A/B root pointer    │
-│                 commit manager      │
-├──────────────┬──────────────────────┤
-│  codec       │  allocator           │
-│  serialize + │  block bitmap        │
-│  encrypt     │                      │
-├──────────────┴──────────────────────┤
-│  crypto         ChaCha20-Poly1305   │
-├─────────────────────────────────────┤
-│  block_store    trait BlockStore    │
-│                 Memory/Disk/Device  │
-├─────────────────────────────────────┤
-│  model          on-disk types       │
-│  error          FsError / FsResult  │
-└─────────────────────────────────────┘
+┌─────────────────────────────────────────┐
+│  ffi              C ABI for Swift/etc   │
+├─────────────────────────────────────────┤
+│  fs               FilesystemCore        │
+├─────────────────────────────────────────┤
+│  transaction      A/B root pointer      │
+│                   commit manager        │
+├──────────────┬──────────────────────────┤
+│  codec       │  allocator               │
+│  serialize + │  block bitmap            │
+│  encrypt     │                          │
+├──────────────┴──────────────────────────┤
+│  crypto           ChaCha20-Poly1305     │
+├─────────────────────────────────────────┤
+│  cached_store     Write-back LRU cache  │
+├─────────────────────────────────────────┤
+│  block_store      trait BlockStore      │
+│    ├ MemoryBlockStore    (testing)      │
+│    ├ DiskBlockStore      (file images)  │
+│    ├ DeviceBlockStore    (raw devices)  │
+│    └ NetworkBlockStore   (mTLS, opt)    │
+├─────────────────────────────────────────┤
+│  proto            wire protocol types   │
+├─────────────────────────────────────────┤
+│  model / error    on-disk types         │
+└─────────────────────────────────────────┘
 ```
 
 ## Modules
@@ -137,8 +143,14 @@ pub trait BlockStore: Send + Sync {
     fn read_block(&self, block_id: u64) -> FsResult<Vec<u8>>;
     fn write_block(&self, block_id: u64, data: &[u8]) -> FsResult<()>;
     fn sync(&self) -> FsResult<()> { Ok(()) }  // default no-op
+
+    // Batch operations — overridden by NetworkBlockStore for pipelined I/O.
+    fn read_blocks(&self, block_ids: &[u64]) -> FsResult<Vec<Vec<u8>>>;
+    fn write_blocks(&self, blocks: &[(u64, &[u8])]) -> FsResult<()>;
 }
 ```
+
+The `read_blocks`/`write_blocks` methods have default sequential implementations. The network backend overrides them with pipelined I/O.
 
 **`MemoryBlockStore`** — in-memory `HashMap<u64, Vec<u8>>` behind a `Mutex`. Good for tests and ephemeral use.
 
@@ -174,6 +186,99 @@ let store = DeviceBlockStore::initialize("/dev/xvdf", 65536, 0)?;
 > **Note:** The process must have read/write permissions on the device node. On EC2, you typically need `root` or membership in the `disk` group.
 
 **Implementing a custom backend:** Implement the `BlockStore` trait. The rest of the stack works with `Arc<dyn BlockStore>`, so any backend (network, FUSE, database) can be plugged in without changing any other code.
+
+### `cached_store` — Write-back LRU cache
+
+`CachedBlockStore<S>` wraps any `BlockStore` with an in-memory LRU cache. Reads are served from cache when possible; writes are marked dirty and flushed in batch on `sync()`. If a dirty entry is evicted by cache pressure, it is written-back to the inner store immediately.
+
+```rust
+use doublecrypt_core::cached_store::CachedBlockStore;
+
+// Wrap any BlockStore with a 1024-block LRU cache.
+let cached = CachedBlockStore::new(inner_store, 1024);
+
+cached.write_block(0, &data)?;  // dirty, in cache only
+cached.sync()?;                 // batch-flush to inner store
+```
+
+The cache uses `write_blocks()` during `sync()`, so a `NetworkBlockStore` underneath benefits from pipelined batch writes.
+
+### `network_store` — Remote mTLS block store _(feature: `network`)_
+
+`NetworkBlockStore` connects to a [`doublecrypt-server`](https://github.com/doublecrypt/doublecrypt-server) over mutual TLS using a 4-byte little-endian length-prefixed protobuf protocol.
+
+```rust
+use std::path::Path;
+use doublecrypt_core::network_store::NetworkBlockStore;
+
+let store = NetworkBlockStore::connect(
+    "10.0.0.5:9100",
+    "block-server",
+    Path::new("certs/client.pem"),
+    Path::new("certs/client-key.pem"),
+    Path::new("certs/ca.pem"),
+)?;
+```
+
+Or with the builder for full control:
+
+```rust
+use std::time::Duration;
+use doublecrypt_core::network_store::{NetworkBlockStore, NetworkBlockStoreConfig};
+
+let store = NetworkBlockStore::from_config(
+    NetworkBlockStoreConfig::new("10.0.0.5:9100", "block-server")
+        .client_cert("certs/client.pem")
+        .client_key("certs/client-key.pem")
+        .ca_cert("certs/ca.pem")
+        .connect_timeout(Duration::from_secs(5))
+        .io_timeout(Duration::from_secs(60)),
+)?;
+```
+
+**Features:**
+
+- **Request pipelining** — `read_blocks()`/`write_blocks()` send a full batch of requests before reading any responses (up to 64 at a time).
+- **Automatic reconnection** — one transparent retry with a fresh TLS handshake on I/O failure.
+- **Configurable timeouts** — connect timeout (default 10 s) and I/O timeout (default 30 s).
+
+**Typical production setup** (network + cache):
+
+```rust
+use std::sync::Arc;
+use doublecrypt_core::network_store::NetworkBlockStore;
+use doublecrypt_core::cached_store::CachedBlockStore;
+use doublecrypt_core::crypto::ChaChaEngine;
+use doublecrypt_core::fs::FilesystemCore;
+
+let net = NetworkBlockStore::connect(addr, sni, cert, key, ca)?;
+let store = Arc::new(CachedBlockStore::new(net, 1024));
+let crypto = Arc::new(ChaChaEngine::new(&master_key)?);
+let mut fs = FilesystemCore::new(store, crypto);
+fs.open()?;
+```
+
+### `proto` — Wire protocol types
+
+The `proto` module contains hand-written [prost](https://crates.io/crates/prost) structs defining the length-prefixed protobuf wire protocol used between `NetworkBlockStore` and `doublecrypt-server`. It is **always available** (not feature-gated).
+
+**Key types:**
+
+| Type                 | Purpose                                               |
+| -------------------- | ----------------------------------------------------- |
+| `Request`            | Top-level message: one-of `Command` variants          |
+| `Response`           | Top-level message: one-of `Result` variants           |
+| `request::Command`   | `ReadBlock`, `WriteBlock`, `Sync`, `GetInfo`          |
+| `response::Result`   | `ReadBlock`, `WriteBlock`, `Sync`, `GetInfo`, `Error` |
+| `ReadBlockRequest`   | `block_id: u64`                                       |
+| `ReadBlockResponse`  | `block_id: u64`, `data: Vec<u8>`                      |
+| `WriteBlockRequest`  | `block_id: u64`, `data: Vec<u8>`                      |
+| `WriteBlockResponse` | _(empty — success acknowledgement)_                   |
+| `SyncResponse`       | _(empty — success acknowledgement)_                   |
+| `GetInfoResponse`    | `block_size: u64`, `total_blocks: u64`                |
+| `ErrorResponse`      | `code: i32`, `message: String`                        |
+
+See [Sharing protocol types](#sharing-protocol-types-with-doublecrypt-server) in the Features section for cross-crate usage.
 
 ### `allocator` — Block allocation
 
@@ -341,23 +446,23 @@ cargo build --release
 
 **FFI functions:**
 
-| Function                                                                               | Purpose                    |
-| -------------------------------------------------------------------------------------- | -------------------------- |
-| `fs_create(total_blocks, key, key_len) → *FsHandle`                                           | Create in-memory FS         |
-| `fs_create_disk(path, total_blocks, block_size, create_new, key, key_len) → *FsHandle`        | Create/open disk FS         |
-| `fs_create_device(path, total_blocks, block_size, initialize, key, key_len) → *FsHandle`      | Open/init block device FS   |
-| `fs_destroy(handle)`                                                                          | Free handle                 |
-| `fs_init_filesystem(handle) → i32`                                                     | Format new FS              |
-| `fs_open(handle) → i32`                                                                | Mount existing FS          |
-| `fs_create_file(handle, name) → i32`                                                   | Create file                |
-| `fs_write_file(handle, name, offset, data, len) → i32`                                 | Write data                 |
-| `fs_read_file(handle, name, offset, len, out_buf, out_len) → i32`                      | Read into buffer           |
-| `fs_list_root(handle, out_error) → *char`                                              | List root dir (JSON)       |
-| `fs_create_dir(handle, name) → i32`                                                    | Create directory           |
-| `fs_remove_file(handle, name) → i32`                                                   | Remove file/dir            |
-| `fs_rename(handle, old, new) → i32`                                                    | Rename                     |
-| `fs_sync(handle) → i32`                                                                | Flush                      |
-| `fs_free_string(s)`                                                                    | Free Rust-allocated string |
+| Function                                                                                 | Purpose                    |
+| ---------------------------------------------------------------------------------------- | -------------------------- |
+| `fs_create(total_blocks, key, key_len) → *FsHandle`                                      | Create in-memory FS        |
+| `fs_create_disk(path, total_blocks, block_size, create_new, key, key_len) → *FsHandle`   | Create/open disk FS        |
+| `fs_create_device(path, total_blocks, block_size, initialize, key, key_len) → *FsHandle` | Open/init block device FS  |
+| `fs_destroy(handle)`                                                                     | Free handle                |
+| `fs_init_filesystem(handle) → i32`                                                       | Format new FS              |
+| `fs_open(handle) → i32`                                                                  | Mount existing FS          |
+| `fs_create_file(handle, name) → i32`                                                     | Create file                |
+| `fs_write_file(handle, name, offset, data, len) → i32`                                   | Write data                 |
+| `fs_read_file(handle, name, offset, len, out_buf, out_len) → i32`                        | Read into buffer           |
+| `fs_list_root(handle, out_error) → *char`                                                | List root dir (JSON)       |
+| `fs_create_dir(handle, name) → i32`                                                      | Create directory           |
+| `fs_remove_file(handle, name) → i32`                                                     | Remove file/dir            |
+| `fs_rename(handle, old, new) → i32`                                                      | Rename                     |
+| `fs_sync(handle) → i32`                                                                  | Flush                      |
+| `fs_free_string(s)`                                                                      | Free Rust-allocated string |
 
 All functions return `0` on success or a negative `FsErrorCode` value on failure.
 
@@ -392,6 +497,48 @@ envelope = EncryptedObject { kind, version, nonce: [u8;12], ciphertext }
     where ciphertext = AEAD(plaintext || 16-byte Poly1305 tag)
     and plaintext = postcard-serialized Inode / DirectoryPage / ExtentMap / raw file data
 ```
+
+## Features
+
+| Feature   | Default | What it enables                                      |
+| --------- | ------- | ---------------------------------------------------- |
+| `network` | **yes** | `NetworkBlockStore` (rustls mTLS client)             |
+| _(none)_  | always  | `proto` module (prost structs for the wire protocol) |
+
+```toml
+# Default — includes network support:
+doublecrypt-core = "0.1"
+
+# Local-only (no TLS dependencies, but proto types are still available):
+doublecrypt-core = { version = "0.1", default-features = false }
+```
+
+### Sharing protocol types with `doublecrypt-server`
+
+The `proto` module is **always available** regardless of feature flags. It contains hand-written [prost](https://crates.io/crates/prost) structs that define the wire protocol (requests, responses, error codes), so there is no need for `protoc` or `prost-build` at compile time.
+
+This makes `doublecrypt-core` the single source of truth for the protocol. The server can import the types directly:
+
+```toml
+# In doublecrypt-server/Cargo.toml:
+[dependencies]
+doublecrypt-core = { version = "0.1", default-features = false }  # proto only, no TLS client
+```
+
+```rust
+use doublecrypt_core::proto::{
+    Request, Response,
+    request::Command,
+    response::Result as RespResult,
+    ReadBlockRequest, ReadBlockResponse,
+    WriteBlockRequest, WriteBlockResponse,
+    SyncRequest, SyncResponse,
+    GetInfoRequest, GetInfoResponse,
+    ErrorResponse,
+};
+```
+
+With `default-features = false`, only `prost` (for derive macros and encoding/decoding) is pulled in — no TLS dependencies.
 
 ## Limitations (v0.1)
 
@@ -448,13 +595,25 @@ try fs.mount()
 
 ## Examples
 
-A sample program that creates a disk image:
+Create a local disk image:
 
 ```bash
 cargo run --example create_image
 ```
 
-See `examples/create_image.rs`.
+Connect to a remote `doublecrypt-server` (network-backed):
+
+```bash
+cargo run --example network_mount -- \
+    --addr 10.0.0.5:9100 \
+    --server-name block-server \
+    --cert certs/client.pem \
+    --key certs/client-key.pem \
+    --ca certs/ca.pem \
+    --master-key 0000000000000000000000000000000000000000000000000000000000000000
+```
+
+See `examples/create_image.rs` and `examples/network_mount.rs`.
 
 ## Swift Integration
 

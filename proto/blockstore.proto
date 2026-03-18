@@ -1,0 +1,62 @@
+// Reference copy of the doublecrypt-server protocol definition.
+// The Rust structs in src/proto.rs are hand-written prost equivalents.
+
+syntax = "proto3";
+
+package doublecrypt;
+
+// ── Requests ────────────────────────────────────────────────
+
+message Request {
+  uint64 request_id = 1;
+  oneof command {
+    ReadBlockRequest read_block = 2;
+    WriteBlockRequest write_block = 3;
+    SyncRequest sync = 4;
+    GetInfoRequest get_info = 5;
+  }
+}
+
+message ReadBlockRequest {
+  uint64 block_id = 1;
+}
+
+message WriteBlockRequest {
+  uint64 block_id = 1;
+  bytes data = 2;
+}
+
+message SyncRequest {}
+
+message GetInfoRequest {}
+
+// ── Responses ───────────────────────────────────────────────
+
+message Response {
+  uint64 request_id = 1;
+  oneof result {
+    ReadBlockResponse read_block = 2;
+    WriteBlockResponse write_block = 3;
+    SyncResponse sync = 4;
+    GetInfoResponse get_info = 5;
+    ErrorResponse error = 6;
+  }
+}
+
+message ReadBlockResponse {
+  bytes data = 1;
+}
+
+message WriteBlockResponse {}
+
+message SyncResponse {}
+
+message GetInfoResponse {
+  uint32 block_size = 1;
+  uint64 total_blocks = 2;
+}
+
+message ErrorResponse {
+  int32 code = 1;
+  string message = 2;
+}

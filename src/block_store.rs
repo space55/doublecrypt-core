@@ -25,6 +25,25 @@ pub trait BlockStore: Send + Sync {
     fn sync(&self) -> FsResult<()> {
         Ok(())
     }
+
+    /// Read multiple blocks in one call.
+    ///
+    /// The default implementation reads them sequentially; network-backed
+    /// stores should override this with pipelined I/O.
+    fn read_blocks(&self, block_ids: &[u64]) -> FsResult<Vec<Vec<u8>>> {
+        block_ids.iter().map(|&id| self.read_block(id)).collect()
+    }
+
+    /// Write multiple blocks in one call.
+    ///
+    /// The default implementation writes them sequentially; network-backed
+    /// stores should override this with pipelined I/O.
+    fn write_blocks(&self, blocks: &[(u64, &[u8])]) -> FsResult<()> {
+        for &(id, data) in blocks {
+            self.write_block(id, data)?;
+        }
+        Ok(())
+    }
 }
 
 /// Simple in-memory block store for testing and development.
