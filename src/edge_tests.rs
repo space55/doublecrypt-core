@@ -35,9 +35,13 @@ fn test_empty_filename_rejected() {
 #[test]
 fn test_slash_in_filename_rejected() {
     let mut fs = make_fs();
+    // "foo/bar" is now treated as a path (create "bar" inside dir "foo").
+    // It should still fail because directory "foo" does not exist.
     assert!(fs.create_file("foo/bar").is_err());
+    // "/" resolves to an empty leaf, which is an error.
     assert!(fs.create_file("/").is_err());
-    assert!(fs.create_file("a/").is_err());
+    // "a/" trims to "a", which is now a valid single-component path.
+    assert!(fs.create_file("a/").is_ok());
 }
 
 #[test]
@@ -52,7 +56,7 @@ fn test_max_length_filename() {
     let mut fs = make_fs();
     let long_name: String = "x".repeat(MAX_NAME_LEN);
     fs.create_file(&long_name).unwrap();
-    let entries = fs.list_directory().unwrap();
+    let entries = fs.list_directory("").unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].name, long_name);
 }
@@ -71,7 +75,7 @@ fn test_unicode_filename() {
     fs.create_file("émojis_🔥🎉.data").unwrap();
     fs.create_file("Ñoño").unwrap();
 
-    let entries = fs.list_directory().unwrap();
+    let entries = fs.list_directory("").unwrap();
     assert_eq!(entries.len(), 3);
     let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
     assert!(names.contains(&"日本語ファイル.txt"));
@@ -89,7 +93,7 @@ fn test_filename_with_spaces_and_special_chars() {
     fs.create_file("tab\there").unwrap();
     fs.create_file("new\nline").unwrap();
 
-    let entries = fs.list_directory().unwrap();
+    let entries = fs.list_directory("").unwrap();
     assert_eq!(entries.len(), 6);
 }
 
@@ -99,7 +103,7 @@ fn test_filename_single_char() {
     fs.create_file("a").unwrap();
     fs.create_file("b").unwrap();
     fs.create_file(".").unwrap(); // "." as a filename (not path)
-    let entries = fs.list_directory().unwrap();
+    let entries = fs.list_directory("").unwrap();
     assert_eq!(entries.len(), 3);
 }
 
@@ -257,7 +261,7 @@ fn test_many_files_in_root() {
         fs.write_file(&name, 0, payload.as_bytes()).unwrap();
     }
 
-    let entries = fs.list_directory().unwrap();
+    let entries = fs.list_directory("").unwrap();
     assert_eq!(entries.len(), count);
 
     // Verify a sample.
@@ -274,7 +278,7 @@ fn test_create_delete_cycle() {
         fs.write_file(&name, 0, b"temporary").unwrap();
         fs.remove_file(&name).unwrap();
     }
-    let entries = fs.list_directory().unwrap();
+    let entries = fs.list_directory("").unwrap();
     assert!(entries.is_empty());
 }
 
@@ -293,7 +297,7 @@ fn test_rename_chain() {
     let data = fs.read_file("name_19", 0, 1024).unwrap();
     assert_eq!(data, b"persistent data");
 
-    let entries = fs.list_directory().unwrap();
+    let entries = fs.list_directory("").unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].name, "name_19");
 }
@@ -391,7 +395,7 @@ fn test_operations_before_init() {
     let crypto = Arc::new(ChaChaEngine::generate().unwrap());
     let mut fs = FilesystemCore::new(store, crypto);
 
-    assert!(fs.list_directory().is_err());
+    assert!(fs.list_directory("").is_err());
     assert!(fs.create_file("x").is_err());
     assert!(fs.read_file("x", 0, 10).is_err());
     assert!(fs.write_file("x", 0, b"data").is_err());
@@ -505,7 +509,7 @@ fn test_reopen_after_many_mutations() {
     let mut fs = FilesystemCore::new(store, crypto);
     fs.open().unwrap();
 
-    let entries = fs.list_directory().unwrap();
+    let entries = fs.list_directory("").unwrap();
     // 20 created - 10 deleted = 10 remaining.
     assert_eq!(entries.len(), 10);
 
@@ -549,7 +553,7 @@ fn test_reopen_preserves_file_sizes() {
     let mut fs = FilesystemCore::new(store, crypto);
     fs.open().unwrap();
 
-    let entries = fs.list_directory().unwrap();
+    let entries = fs.list_directory("").unwrap();
     assert_eq!(entries.len(), sizes.len());
 
     for (i, &sz) in sizes.iter().enumerate() {
@@ -624,7 +628,7 @@ fn test_interleaved_create_write_read_delete() {
     fs.rename("c", "a").unwrap();
     assert_eq!(fs.read_file("a", 0, 100).unwrap(), b"gamma");
 
-    let entries = fs.list_directory().unwrap();
+    let entries = fs.list_directory("").unwrap();
     assert_eq!(entries.len(), 2);
 }
 
@@ -643,7 +647,7 @@ fn test_double_init_reinitializes() {
     // (though blocks may linger since no GC).
     fs.init_filesystem().unwrap();
 
-    let entries = fs.list_directory().unwrap();
+    let entries = fs.list_directory("").unwrap();
     assert!(entries.is_empty());
 }
 
@@ -807,15 +811,15 @@ fn test_file_size_tracking() {
     let mut fs = make_fs();
     fs.create_file("tracked.bin").unwrap();
 
-    let entries = fs.list_directory().unwrap();
+    let entries = fs.list_directory("").unwrap();
     assert_eq!(entries[0].size, 0);
 
     fs.write_file("tracked.bin", 0, b"12345").unwrap();
-    let entries = fs.list_directory().unwrap();
+    let entries = fs.list_directory("").unwrap();
     assert_eq!(entries[0].size, 5);
 
     fs.write_file("tracked.bin", 0, b"123456789").unwrap();
-    let entries = fs.list_directory().unwrap();
+    let entries = fs.list_directory("").unwrap();
     assert_eq!(entries[0].size, 9);
 }
 
@@ -835,7 +839,7 @@ fn test_many_commits_alternate_root_pointers() {
     let mut fs2 = FilesystemCore::new(store, crypto);
     fs2.open().unwrap();
 
-    let entries = fs2.list_directory().unwrap();
+    let entries = fs2.list_directory("").unwrap();
     assert_eq!(entries.len(), 10);
 }
 
@@ -874,7 +878,7 @@ fn test_disk_backed_filesystem_full_cycle() {
         let mut fs = FilesystemCore::new(store, crypto.clone());
         fs.open().unwrap();
 
-        let entries = fs.list_directory().unwrap();
+        let entries = fs.list_directory("").unwrap();
         assert_eq!(entries.len(), 3);
 
         let data = fs.read_file("hello.txt", 0, 1024).unwrap();
@@ -898,7 +902,7 @@ fn test_disk_backed_filesystem_full_cycle() {
         let mut fs = FilesystemCore::new(store, crypto.clone());
         fs.open().unwrap();
 
-        let entries = fs.list_directory().unwrap();
+        let entries = fs.list_directory("").unwrap();
         assert_eq!(entries.len(), 2);
 
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
@@ -919,9 +923,17 @@ fn test_disk_backed_filesystem_full_cycle() {
 /// Real block devices can't be created in tests, but DeviceBlockStore
 /// works on any seekable file — the key difference from DiskBlockStore
 /// is the lseek(SEEK_END) size discovery path.
-fn create_fake_device(name: &str, block_size: usize, total_blocks: u64) -> (String, std::path::PathBuf) {
+fn create_fake_device(
+    name: &str,
+    block_size: usize,
+    total_blocks: u64,
+) -> (String, std::path::PathBuf) {
     let dir = std::env::temp_dir();
-    let path = dir.join(format!("doublecrypt_dev_{}_{}.raw", name, std::process::id()));
+    let path = dir.join(format!(
+        "doublecrypt_dev_{}_{}.raw",
+        name,
+        std::process::id()
+    ));
     let path_str = path.to_str().unwrap().to_string();
     let _ = std::fs::remove_file(&path);
 
@@ -1005,7 +1017,10 @@ fn test_device_block_store_initialize_fills_with_random() {
             break;
         }
     }
-    assert!(any_nonzero, "initialize should fill blocks with random data");
+    assert!(
+        any_nonzero,
+        "initialize should fill blocks with random data"
+    );
 
     std::fs::remove_file(&path).unwrap();
 }
@@ -1017,12 +1032,14 @@ fn test_device_backed_filesystem_full_cycle() {
 
     // Initialize the device and create a filesystem.
     {
-        let store = Arc::new(DeviceBlockStore::initialize(&path_str, DEFAULT_BLOCK_SIZE, 0).unwrap());
+        let store =
+            Arc::new(DeviceBlockStore::initialize(&path_str, DEFAULT_BLOCK_SIZE, 0).unwrap());
         let mut fs = FilesystemCore::new(store, crypto.clone());
         fs.init_filesystem().unwrap();
 
         fs.create_file("secret.txt").unwrap();
-        fs.write_file("secret.txt", 0, b"Top secret data on a device!").unwrap();
+        fs.write_file("secret.txt", 0, b"Top secret data on a device!")
+            .unwrap();
 
         fs.create_directory("vault").unwrap();
 
@@ -1041,7 +1058,7 @@ fn test_device_backed_filesystem_full_cycle() {
         let mut fs = FilesystemCore::new(store, crypto.clone());
         fs.open().unwrap();
 
-        let entries = fs.list_directory().unwrap();
+        let entries = fs.list_directory("").unwrap();
         assert_eq!(entries.len(), 3);
 
         let data = fs.read_file("secret.txt", 0, 1024).unwrap();
@@ -1063,7 +1080,7 @@ fn test_device_backed_filesystem_full_cycle() {
         let mut fs = FilesystemCore::new(store, crypto.clone());
         fs.open().unwrap();
 
-        let entries = fs.list_directory().unwrap();
+        let entries = fs.list_directory("").unwrap();
         assert_eq!(entries.len(), 2);
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert!(names.contains(&"classified.txt"));
@@ -1086,7 +1103,8 @@ fn test_device_open_with_wrong_key_fails() {
 
     // Init with key 1.
     {
-        let store = Arc::new(DeviceBlockStore::initialize(&path_str, DEFAULT_BLOCK_SIZE, 0).unwrap());
+        let store =
+            Arc::new(DeviceBlockStore::initialize(&path_str, DEFAULT_BLOCK_SIZE, 0).unwrap());
         let mut fs = FilesystemCore::new(store, crypto1.clone());
         fs.init_filesystem().unwrap();
         fs.create_file("test.txt").unwrap();
@@ -1158,13 +1176,18 @@ fn test_device_multiple_files_and_directories() {
     // Create a mix of files and directories.
     for i in 0..10 {
         fs.create_file(&format!("file_{i}.txt")).unwrap();
-        fs.write_file(&format!("file_{i}.txt"), 0, format!("content_{i}").as_bytes()).unwrap();
+        fs.write_file(
+            &format!("file_{i}.txt"),
+            0,
+            format!("content_{i}").as_bytes(),
+        )
+        .unwrap();
     }
     for i in 0..5 {
         fs.create_directory(&format!("dir_{i}")).unwrap();
     }
 
-    let entries = fs.list_directory().unwrap();
+    let entries = fs.list_directory("").unwrap();
     assert_eq!(entries.len(), 15);
 
     // Verify each file has the correct content.
@@ -1177,7 +1200,7 @@ fn test_device_multiple_files_and_directories() {
     fs.remove_file("file_0.txt").unwrap();
     fs.remove_file("dir_0").unwrap();
 
-    let entries = fs.list_directory().unwrap();
+    let entries = fs.list_directory("").unwrap();
     assert_eq!(entries.len(), 13);
 
     fs.sync().unwrap();

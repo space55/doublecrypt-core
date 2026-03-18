@@ -16,6 +16,10 @@ use crate::transaction::TransactionManager;
 
 /// The main filesystem core. Owns the block store, crypto, codec, allocator,
 /// and transaction manager. Provides high-level filesystem operations.
+///
+/// All path-accepting methods use `/`-separated paths.  An empty string or
+/// `"/"` refers to the root directory.  Parent directories must already exist;
+/// only `create_file` and `create_directory` create the leaf entry.
 pub struct FilesystemCore {
     store: Arc<dyn BlockStore>,
     crypto: Arc<dyn CryptoEngine>,
@@ -26,6 +30,14 @@ pub struct FilesystemCore {
     superblock: Option<Superblock>,
     /// Next inode ID to allocate.
     next_inode_id: InodeId,
+}
+
+/// Tracks one ancestor directory during path resolution, used by
+/// `commit_cow_chain` to propagate CoW writes back to the root.
+struct AncestorEntry {
+    inode: Inode,
+    dir_page: DirectoryPage,
+    child_index: usize,
 }
 
 /// Maximum payload size for a single file data chunk.
@@ -172,26 +184,146 @@ impl FilesystemCore {
 
     // ── File operations ──
 
-    /// Create a new empty file in the given directory (by inode ref).
-    /// For V1, only root directory is supported.
-    pub fn create_file(&mut self, name: &str) -> FsResult<()> {
-        self.validate_name(name)?;
+    // ── Path helpers ──────────────────────────────────────────
+
+    /// Split a path into its directory components and the leaf name.
+    /// Returns `(["a","b"], "c")` for `"a/b/c"`, or `([], "c")` for `"c"`.
+    fn split_path(path: &str) -> FsResult<(Vec<&str>, &str)> {
+        let trimmed = path.trim_matches('/');
+        if trimmed.is_empty() {
+            return Err(FsError::Internal("empty path".into()));
+        }
+        let parts: Vec<&str> = trimmed.split('/').collect();
+        let (dirs, leaf) = parts.split_at(parts.len() - 1);
+        Ok((dirs.to_vec(), leaf[0]))
+    }
+
+    /// Parse a directory path (may be empty / "/" for root) into components.
+    fn split_dir_path(path: &str) -> Vec<&str> {
+        let trimmed = path.trim_matches('/');
+        if trimmed.is_empty() {
+            return Vec::new();
+        }
+        trimmed.split('/').collect()
+    }
+
+    /// Resolve a sequence of directory components starting from the root inode,
+    /// returning the ancestor chain needed for CoW commit propagation.
+    ///
+    /// Returns `(ancestors, target_inode, target_dir_page)` where `ancestors`
+    /// is a list of `(Inode, DirectoryPage, entry_index_in_parent)` from root
+    /// down to (but not including) the final resolved directory.
+    fn resolve_dir_chain(
+        &self,
+        components: &[&str],
+        root_inode: &Inode,
+    ) -> FsResult<(Vec<AncestorEntry>, Inode, DirectoryPage)> {
+        let mut ancestors: Vec<AncestorEntry> = Vec::new();
+        let mut current_inode = root_inode.clone();
+        let mut current_dir_page: DirectoryPage =
+            self.read_obj(current_inode.directory_page_ref.block_id)?;
+
+        for component in components {
+            let idx = current_dir_page
+                .entries
+                .iter()
+                .position(|e| e.name == *component)
+                .ok_or_else(|| FsError::DirectoryNotFound(component.to_string()))?;
+
+            let entry = &current_dir_page.entries[idx];
+            if entry.kind != InodeKind::Directory {
+                return Err(FsError::NotADirectory(component.to_string()));
+            }
+
+            let child_inode: Inode = self.read_obj(entry.inode_ref.block_id)?;
+            let child_dir_page: DirectoryPage =
+                self.read_obj(child_inode.directory_page_ref.block_id)?;
+
+            ancestors.push(AncestorEntry {
+                inode: current_inode,
+                dir_page: current_dir_page,
+                child_index: idx,
+            });
+
+            current_inode = child_inode;
+            current_dir_page = child_dir_page;
+        }
+
+        Ok((ancestors, current_inode, current_dir_page))
+    }
+
+    /// After mutating a directory's page, propagate CoW changes up through
+    /// the ancestor chain to the root, then commit a new superblock.
+    ///
+    /// `new_dir_page` is the already-modified DirectoryPage of the target dir.
+    /// `target_inode` is the inode of the directory that owns `new_dir_page`.
+    /// `ancestors` is the chain from root down to (but not including) target.
+    fn commit_cow_chain(
+        &mut self,
+        sb: &Superblock,
+        ancestors: &[AncestorEntry],
+        target_inode: &Inode,
+        new_dir_page: &DirectoryPage,
+    ) -> FsResult<()> {
+        // Write the modified directory page.
+        let mut new_dp_block = self.allocator.allocate()?;
+        self.write_obj(new_dp_block, ObjectKind::DirectoryPage, new_dir_page)?;
+
+        // Write the modified directory inode.
+        let mut new_inode = target_inode.clone();
+        new_inode.directory_page_ref = ObjectRef::new(new_dp_block);
+        new_inode.modified_at = now_secs();
+        let mut new_inode_block = self.allocator.allocate()?;
+        self.write_obj(new_inode_block, ObjectKind::Inode, &new_inode)?;
+
+        // Propagate upward through ancestors (bottom to top).
+        for ancestor in ancestors.iter().rev() {
+            let mut parent_dp = ancestor.dir_page.clone();
+            parent_dp.entries[ancestor.child_index].inode_ref = ObjectRef::new(new_inode_block);
+
+            new_dp_block = self.allocator.allocate()?;
+            self.write_obj(new_dp_block, ObjectKind::DirectoryPage, &parent_dp)?;
+
+            let mut parent_inode = ancestor.inode.clone();
+            parent_inode.directory_page_ref = ObjectRef::new(new_dp_block);
+            parent_inode.modified_at = now_secs();
+            new_inode_block = self.allocator.allocate()?;
+            self.write_obj(new_inode_block, ObjectKind::Inode, &parent_inode)?;
+        }
+
+        // new_inode_block is now the new root inode block.
+        let new_sb = Superblock {
+            generation: sb.generation + 1,
+            root_inode_ref: ObjectRef::new(new_inode_block),
+        };
+        self.commit_superblock(new_sb)?;
+        Ok(())
+    }
+
+    // ── Public operations ─────────────────────────────────────
+
+    /// Create a new empty file at the given path.
+    ///
+    /// Parent directories must already exist.  The leaf name is created in
+    /// the innermost directory.
+    pub fn create_file(&mut self, path: &str) -> FsResult<()> {
+        let (dir_parts, leaf) = Self::split_path(path)?;
+        self.validate_name(leaf)?;
         let sb = self
             .superblock
             .as_ref()
             .ok_or(FsError::NotInitialized)?
             .clone();
 
-        // Load root inode and its directory page.
         let root_inode: Inode = self.read_obj(sb.root_inode_ref.block_id)?;
-        let mut dir_page: DirectoryPage = self.read_obj(root_inode.directory_page_ref.block_id)?;
+        let (ancestors, target_inode, mut dir_page) =
+            self.resolve_dir_chain(&dir_parts, &root_inode)?;
 
-        // Check for duplicate.
-        if dir_page.entries.iter().any(|e| e.name == name) {
-            return Err(FsError::FileAlreadyExists(name.to_string()));
+        if dir_page.entries.iter().any(|e| e.name == leaf) {
+            return Err(FsError::FileAlreadyExists(leaf.to_string()));
         }
 
-        // Create empty extent map for the file.
+        // Create empty extent map.
         let extent_map = ExtentMap::new();
         let em_block = self.allocator.allocate()?;
         self.write_obj(em_block, ObjectKind::ExtentMap, &extent_map)?;
@@ -211,54 +343,37 @@ impl FilesystemCore {
         let inode_block = self.allocator.allocate()?;
         self.write_obj(inode_block, ObjectKind::Inode, &file_inode)?;
 
-        // Add directory entry.
         dir_page.entries.push(DirectoryEntry {
-            name: name.to_string(),
+            name: leaf.to_string(),
             inode_ref: ObjectRef::new(inode_block),
             inode_id,
             kind: InodeKind::File,
         });
 
-        // Write updated directory page (CoW: new block).
-        let new_dp_block = self.allocator.allocate()?;
-        self.write_obj(new_dp_block, ObjectKind::DirectoryPage, &dir_page)?;
-
-        // Write updated root inode (CoW).
-        let mut new_root = root_inode.clone();
-        new_root.directory_page_ref = ObjectRef::new(new_dp_block);
-        new_root.modified_at = now_secs();
-        let new_root_block = self.allocator.allocate()?;
-        self.write_obj(new_root_block, ObjectKind::Inode, &new_root)?;
-
-        // Update and commit superblock.
-        let new_sb = Superblock {
-            generation: sb.generation + 1,
-            root_inode_ref: ObjectRef::new(new_root_block),
-        };
-        self.commit_superblock(new_sb)?;
-
+        self.commit_cow_chain(&sb, &ancestors, &target_inode, &dir_page)?;
         Ok(())
     }
 
-    /// Write data to a file. For V1, this replaces the entire file content
-    /// (single chunk only if it fits in one block).
-    pub fn write_file(&mut self, name: &str, offset: u64, data: &[u8]) -> FsResult<()> {
+    /// Write data to a file at the given path.
+    pub fn write_file(&mut self, path: &str, offset: u64, data: &[u8]) -> FsResult<()> {
+        let (dir_parts, leaf) = Self::split_path(path)?;
         let sb = self
             .superblock
             .as_ref()
             .ok_or(FsError::NotInitialized)?
             .clone();
         let root_inode: Inode = self.read_obj(sb.root_inode_ref.block_id)?;
-        let dir_page: DirectoryPage = self.read_obj(root_inode.directory_page_ref.block_id)?;
+        let (ancestors, target_inode, dir_page) =
+            self.resolve_dir_chain(&dir_parts, &root_inode)?;
 
         let entry = dir_page
             .entries
             .iter()
-            .find(|e| e.name == name)
-            .ok_or_else(|| FsError::FileNotFound(name.to_string()))?;
+            .find(|e| e.name == leaf)
+            .ok_or_else(|| FsError::FileNotFound(leaf.to_string()))?;
 
         if entry.kind != InodeKind::File {
-            return Err(FsError::NotAFile(name.to_string()));
+            return Err(FsError::NotAFile(leaf.to_string()));
         }
 
         let file_inode: Inode = self.read_obj(entry.inode_ref.block_id)?;
@@ -318,43 +433,30 @@ impl FilesystemCore {
         // Update directory entry to point to new inode block.
         let mut new_dir_page = dir_page.clone();
         for e in &mut new_dir_page.entries {
-            if e.name == name {
+            if e.name == leaf {
                 e.inode_ref = ObjectRef::new(new_inode_block);
             }
         }
-        let new_dp_block = self.allocator.allocate()?;
-        self.write_obj(new_dp_block, ObjectKind::DirectoryPage, &new_dir_page)?;
 
-        // Update root inode.
-        let mut new_root = root_inode.clone();
-        new_root.directory_page_ref = ObjectRef::new(new_dp_block);
-        new_root.modified_at = now_secs();
-        let new_root_block = self.allocator.allocate()?;
-        self.write_obj(new_root_block, ObjectKind::Inode, &new_root)?;
-
-        let new_sb = Superblock {
-            generation: sb.generation + 1,
-            root_inode_ref: ObjectRef::new(new_root_block),
-        };
-        self.commit_superblock(new_sb)?;
-
+        self.commit_cow_chain(&sb, &ancestors, &target_inode, &new_dir_page)?;
         Ok(())
     }
 
-    /// Read file data. Returns the requested slice of the file.
-    pub fn read_file(&self, name: &str, offset: u64, len: usize) -> FsResult<Vec<u8>> {
+    /// Read file data at the given path. Returns the requested slice.
+    pub fn read_file(&self, path: &str, offset: u64, len: usize) -> FsResult<Vec<u8>> {
+        let (dir_parts, leaf) = Self::split_path(path)?;
         let sb = self.superblock.as_ref().ok_or(FsError::NotInitialized)?;
         let root_inode: Inode = self.read_obj(sb.root_inode_ref.block_id)?;
-        let dir_page: DirectoryPage = self.read_obj(root_inode.directory_page_ref.block_id)?;
+        let (_, _, dir_page) = self.resolve_dir_chain(&dir_parts, &root_inode)?;
 
         let entry = dir_page
             .entries
             .iter()
-            .find(|e| e.name == name)
-            .ok_or_else(|| FsError::FileNotFound(name.to_string()))?;
+            .find(|e| e.name == leaf)
+            .ok_or_else(|| FsError::FileNotFound(leaf.to_string()))?;
 
         if entry.kind != InodeKind::File {
-            return Err(FsError::NotAFile(name.to_string()));
+            return Err(FsError::NotAFile(leaf.to_string()));
         }
 
         let file_inode: Inode = self.read_obj(entry.inode_ref.block_id)?;
@@ -370,11 +472,15 @@ impl FilesystemCore {
         Ok(full_data[start..end].to_vec())
     }
 
-    /// List entries in the root directory.
-    pub fn list_directory(&self) -> FsResult<Vec<DirListEntry>> {
+    /// List entries in a directory at the given path.
+    ///
+    /// Pass `""` or `"/"` to list the root directory.
+    pub fn list_directory(&self, path: &str) -> FsResult<Vec<DirListEntry>> {
         let sb = self.superblock.as_ref().ok_or(FsError::NotInitialized)?;
         let root_inode: Inode = self.read_obj(sb.root_inode_ref.block_id)?;
-        let dir_page: DirectoryPage = self.read_obj(root_inode.directory_page_ref.block_id)?;
+
+        let components = Self::split_dir_path(path);
+        let (_, _, dir_page) = self.resolve_dir_chain(&components, &root_inode)?;
 
         let mut result = Vec::new();
         for entry in &dir_page.entries {
@@ -389,19 +495,23 @@ impl FilesystemCore {
         Ok(result)
     }
 
-    /// Create a subdirectory in the root directory.
-    pub fn create_directory(&mut self, name: &str) -> FsResult<()> {
-        self.validate_name(name)?;
+    /// Create a subdirectory at the given path.
+    ///
+    /// Parent directories must already exist; only the leaf is created.
+    pub fn create_directory(&mut self, path: &str) -> FsResult<()> {
+        let (dir_parts, leaf) = Self::split_path(path)?;
+        self.validate_name(leaf)?;
         let sb = self
             .superblock
             .as_ref()
             .ok_or(FsError::NotInitialized)?
             .clone();
         let root_inode: Inode = self.read_obj(sb.root_inode_ref.block_id)?;
-        let mut dir_page: DirectoryPage = self.read_obj(root_inode.directory_page_ref.block_id)?;
+        let (ancestors, target_inode, mut dir_page) =
+            self.resolve_dir_chain(&dir_parts, &root_inode)?;
 
-        if dir_page.entries.iter().any(|e| e.name == name) {
-            return Err(FsError::DirectoryAlreadyExists(name.to_string()));
+        if dir_page.entries.iter().any(|e| e.name == leaf) {
+            return Err(FsError::DirectoryAlreadyExists(leaf.to_string()));
         }
 
         // Create empty directory page for the new subdirectory.
@@ -409,7 +519,6 @@ impl FilesystemCore {
         let sub_dp_block = self.allocator.allocate()?;
         self.write_obj(sub_dp_block, ObjectKind::DirectoryPage, &sub_dp)?;
 
-        // Create directory inode.
         let inode_id = self.alloc_inode_id();
         let ts = now_secs();
         let dir_inode = Inode {
@@ -425,119 +534,83 @@ impl FilesystemCore {
         self.write_obj(inode_block, ObjectKind::Inode, &dir_inode)?;
 
         dir_page.entries.push(DirectoryEntry {
-            name: name.to_string(),
+            name: leaf.to_string(),
             inode_ref: ObjectRef::new(inode_block),
             inode_id,
             kind: InodeKind::Directory,
         });
 
-        // CoW commit chain.
-        let new_dp_block = self.allocator.allocate()?;
-        self.write_obj(new_dp_block, ObjectKind::DirectoryPage, &dir_page)?;
-
-        let mut new_root = root_inode.clone();
-        new_root.directory_page_ref = ObjectRef::new(new_dp_block);
-        new_root.modified_at = now_secs();
-        let new_root_block = self.allocator.allocate()?;
-        self.write_obj(new_root_block, ObjectKind::Inode, &new_root)?;
-
-        let new_sb = Superblock {
-            generation: sb.generation + 1,
-            root_inode_ref: ObjectRef::new(new_root_block),
-        };
-        self.commit_superblock(new_sb)?;
-
+        self.commit_cow_chain(&sb, &ancestors, &target_inode, &dir_page)?;
         Ok(())
     }
 
-    /// Remove a file from the root directory.
-    pub fn remove_file(&mut self, name: &str) -> FsResult<()> {
+    /// Remove a file or empty directory at the given path.
+    pub fn remove_file(&mut self, path: &str) -> FsResult<()> {
+        let (dir_parts, leaf) = Self::split_path(path)?;
         let sb = self
             .superblock
             .as_ref()
             .ok_or(FsError::NotInitialized)?
             .clone();
         let root_inode: Inode = self.read_obj(sb.root_inode_ref.block_id)?;
-        let mut dir_page: DirectoryPage = self.read_obj(root_inode.directory_page_ref.block_id)?;
+        let (ancestors, target_inode, mut dir_page) =
+            self.resolve_dir_chain(&dir_parts, &root_inode)?;
 
         let idx = dir_page
             .entries
             .iter()
-            .position(|e| e.name == name)
-            .ok_or_else(|| FsError::FileNotFound(name.to_string()))?;
+            .position(|e| e.name == leaf)
+            .ok_or_else(|| FsError::FileNotFound(leaf.to_string()))?;
 
         let entry = &dir_page.entries[idx];
         if entry.kind == InodeKind::Directory {
-            // Check if directory is empty.
             let dir_inode: Inode = self.read_obj(entry.inode_ref.block_id)?;
             let sub_page: DirectoryPage = self.read_obj(dir_inode.directory_page_ref.block_id)?;
             if !sub_page.entries.is_empty() {
-                return Err(FsError::DirectoryNotEmpty(name.to_string()));
+                return Err(FsError::DirectoryNotEmpty(leaf.to_string()));
             }
         }
 
-        // TODO: free blocks belonging to the removed file (deferred GC).
         dir_page.entries.remove(idx);
-
-        // CoW commit chain.
-        let new_dp_block = self.allocator.allocate()?;
-        self.write_obj(new_dp_block, ObjectKind::DirectoryPage, &dir_page)?;
-
-        let mut new_root = root_inode.clone();
-        new_root.directory_page_ref = ObjectRef::new(new_dp_block);
-        new_root.modified_at = now_secs();
-        let new_root_block = self.allocator.allocate()?;
-        self.write_obj(new_root_block, ObjectKind::Inode, &new_root)?;
-
-        let new_sb = Superblock {
-            generation: sb.generation + 1,
-            root_inode_ref: ObjectRef::new(new_root_block),
-        };
-        self.commit_superblock(new_sb)?;
-
+        self.commit_cow_chain(&sb, &ancestors, &target_inode, &dir_page)?;
         Ok(())
     }
 
-    /// Rename a file or directory within the root directory.
-    pub fn rename(&mut self, old_name: &str, new_name: &str) -> FsResult<()> {
-        self.validate_name(new_name)?;
+    /// Rename a file or directory.  Both `old_path` and `new_path` must share
+    /// the same parent directory (move across directories is not supported yet).
+    pub fn rename(&mut self, old_path: &str, new_path: &str) -> FsResult<()> {
+        let (old_dir, old_leaf) = Self::split_path(old_path)?;
+        let (new_dir, new_leaf) = Self::split_path(new_path)?;
+        self.validate_name(new_leaf)?;
+
+        if old_dir != new_dir {
+            return Err(FsError::Internal(
+                "rename across directories is not supported".into(),
+            ));
+        }
+
         let sb = self
             .superblock
             .as_ref()
             .ok_or(FsError::NotInitialized)?
             .clone();
         let root_inode: Inode = self.read_obj(sb.root_inode_ref.block_id)?;
-        let mut dir_page: DirectoryPage = self.read_obj(root_inode.directory_page_ref.block_id)?;
+        let (ancestors, target_inode, mut dir_page) =
+            self.resolve_dir_chain(&old_dir, &root_inode)?;
 
-        // Check that new_name doesn't already exist.
-        if dir_page.entries.iter().any(|e| e.name == new_name) {
-            return Err(FsError::FileAlreadyExists(new_name.to_string()));
+        if dir_page.entries.iter().any(|e| e.name == new_leaf) {
+            return Err(FsError::FileAlreadyExists(new_leaf.to_string()));
         }
 
         let entry = dir_page
             .entries
             .iter_mut()
-            .find(|e| e.name == old_name)
-            .ok_or_else(|| FsError::FileNotFound(old_name.to_string()))?;
+            .find(|e| e.name == old_leaf)
+            .ok_or_else(|| FsError::FileNotFound(old_leaf.to_string()))?;
 
-        entry.name = new_name.to_string();
+        entry.name = new_leaf.to_string();
 
-        // CoW commit chain.
-        let new_dp_block = self.allocator.allocate()?;
-        self.write_obj(new_dp_block, ObjectKind::DirectoryPage, &dir_page)?;
-
-        let mut new_root = root_inode.clone();
-        new_root.directory_page_ref = ObjectRef::new(new_dp_block);
-        new_root.modified_at = now_secs();
-        let new_root_block = self.allocator.allocate()?;
-        self.write_obj(new_root_block, ObjectKind::Inode, &new_root)?;
-
-        let new_sb = Superblock {
-            generation: sb.generation + 1,
-            root_inode_ref: ObjectRef::new(new_root_block),
-        };
-        self.commit_superblock(new_sb)?;
-
+        self.commit_cow_chain(&sb, &ancestors, &target_inode, &dir_page)?;
         Ok(())
     }
 

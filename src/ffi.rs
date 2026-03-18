@@ -231,7 +231,10 @@ pub unsafe extern "C" fn fs_open(handle: *mut FsHandle) -> i32 {
     }
 }
 
-/// Create a file in the root directory.
+/// Create a file at the given path.
+///
+/// Parent directories must already exist.  The `name` argument may be
+/// a `/`-separated path such as `"a/b/file.txt"`.
 ///
 /// # Safety
 /// `name` must be a valid null-terminated C string.
@@ -247,10 +250,10 @@ pub unsafe extern "C" fn fs_create_file(handle: *mut FsHandle, name: *const c_ch
     }
 }
 
-/// Write data to a file.
+/// Write data to a file at the given path.
 ///
 /// # Safety
-/// - `name` must be a valid null-terminated C string.
+/// - `name` must be a valid null-terminated C string (may contain `/` separators).
 /// - `data` must point to `data_len` valid bytes.
 #[no_mangle]
 pub unsafe extern "C" fn fs_write_file(
@@ -326,6 +329,8 @@ pub unsafe extern "C" fn fs_read_file(
 /// The returned string is allocated by Rust. The caller must free it with `fs_free_string`.
 /// On error, returns null and writes the error code to `*out_error`.
 ///
+/// For listing a subdirectory, use `fs_list_dir` instead.
+///
 /// # Safety
 /// - `handle` must be a valid pointer.
 /// - `out_error` must be a valid pointer (or null if the caller doesn't need the error code).
@@ -338,7 +343,7 @@ pub unsafe extern "C" fn fs_list_root(handle: *mut FsHandle, out_error: *mut i32
         return ptr::null_mut();
     };
 
-    match h.core.list_directory() {
+    match h.core.list_directory("") {
         Ok(entries) => {
             let json = match serde_json::to_string(&entries) {
                 Ok(j) => j,
@@ -371,7 +376,76 @@ pub unsafe extern "C" fn fs_list_root(handle: *mut FsHandle, out_error: *mut i32
     }
 }
 
-/// Create a directory in the root directory.
+/// List a directory at the given path. Returns a JSON string.
+///
+/// Pass an empty string or `"/"` to list the root directory.
+///
+/// The returned string is allocated by Rust. The caller must free it with `fs_free_string`.
+/// On error, returns null and writes the error code to `*out_error`.
+///
+/// # Safety
+/// - `handle` must be a valid pointer.
+/// - `path` must be a valid null-terminated C string (may contain `/` separators).
+/// - `out_error` must be a valid pointer (or null if the caller doesn't need the error code).
+#[no_mangle]
+pub unsafe extern "C" fn fs_list_dir(
+    handle: *mut FsHandle,
+    path: *const c_char,
+    out_error: *mut i32,
+) -> *mut c_char {
+    let Some(h) = (unsafe { handle.as_mut() }) else {
+        if !out_error.is_null() {
+            unsafe { *out_error = FsErrorCode::InvalidArgument as i32 };
+        }
+        return ptr::null_mut();
+    };
+    let path_str = match unsafe { unsafe_cstr_to_str(path) } {
+        Some(s) => s,
+        None => {
+            if !out_error.is_null() {
+                unsafe { *out_error = FsErrorCode::InvalidArgument as i32 };
+            }
+            return ptr::null_mut();
+        }
+    };
+
+    match h.core.list_directory(path_str) {
+        Ok(entries) => {
+            let json = match serde_json::to_string(&entries) {
+                Ok(j) => j,
+                Err(_) => {
+                    if !out_error.is_null() {
+                        unsafe { *out_error = FsErrorCode::InternalError as i32 };
+                    }
+                    return ptr::null_mut();
+                }
+            };
+            if !out_error.is_null() {
+                unsafe { *out_error = FsErrorCode::Ok as i32 };
+            }
+            match CString::new(json) {
+                Ok(cs) => cs.into_raw(),
+                Err(_) => {
+                    if !out_error.is_null() {
+                        unsafe { *out_error = FsErrorCode::InternalError as i32 };
+                    }
+                    ptr::null_mut()
+                }
+            }
+        }
+        Err(ref e) => {
+            if !out_error.is_null() {
+                unsafe { *out_error = FsErrorCode::from(e) as i32 };
+            }
+            ptr::null_mut()
+        }
+    }
+}
+
+/// Create a directory at the given path.
+///
+/// Parent directories must already exist.  The `name` argument may be
+/// a `/`-separated path such as `"a/b/newdir"`.
 ///
 /// # Safety
 /// `name` must be a valid null-terminated C string.
@@ -387,10 +461,10 @@ pub unsafe extern "C" fn fs_create_dir(handle: *mut FsHandle, name: *const c_cha
     }
 }
 
-/// Remove a file (or empty directory) from the root directory.
+/// Remove a file (or empty directory) at the given path.
 ///
 /// # Safety
-/// `name` must be a valid null-terminated C string.
+/// `name` must be a valid null-terminated C string (may contain `/` separators).
 #[no_mangle]
 pub unsafe extern "C" fn fs_remove_file(handle: *mut FsHandle, name: *const c_char) -> i32 {
     let (h, name_str) = match validate_handle_and_name(handle, name) {
@@ -403,10 +477,10 @@ pub unsafe extern "C" fn fs_remove_file(handle: *mut FsHandle, name: *const c_ch
     }
 }
 
-/// Rename a file or directory within the root directory.
+/// Rename a file or directory.  Both paths must share the same parent directory.
 ///
 /// # Safety
-/// `old_name` and `new_name` must be valid null-terminated C strings.
+/// `old_name` and `new_name` must be valid null-terminated C strings (may contain `/` separators).
 #[no_mangle]
 pub unsafe extern "C" fn fs_rename(
     handle: *mut FsHandle,

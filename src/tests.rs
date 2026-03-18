@@ -20,7 +20,7 @@ fn make_fs() -> (FilesystemCore, Arc<MemoryBlockStore>, Arc<ChaChaEngine>) {
 fn test_init_filesystem() {
     let (fs, _, _) = make_fs();
     // Should be able to list empty root directory.
-    let entries = fs.list_directory().unwrap();
+    let entries = fs.list_directory("").unwrap();
     assert!(entries.is_empty());
 }
 
@@ -82,7 +82,7 @@ fn test_list_root_directory() {
     fs.create_file("b.txt").unwrap();
     fs.create_directory("subdir").unwrap();
 
-    let entries = fs.list_directory().unwrap();
+    let entries = fs.list_directory("").unwrap();
     assert_eq!(entries.len(), 3);
 
     let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
@@ -103,7 +103,7 @@ fn test_create_directory() {
 
     fs.create_directory("mydir").unwrap();
 
-    let entries = fs.list_directory().unwrap();
+    let entries = fs.list_directory("").unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].name, "mydir");
     assert_eq!(entries[0].kind, InodeKind::Directory);
@@ -133,12 +133,12 @@ fn test_delete_file() {
     fs.create_file("doomed.txt").unwrap();
     fs.write_file("doomed.txt", 0, b"bye").unwrap();
 
-    let entries = fs.list_directory().unwrap();
+    let entries = fs.list_directory("").unwrap();
     assert_eq!(entries.len(), 1);
 
     fs.remove_file("doomed.txt").unwrap();
 
-    let entries = fs.list_directory().unwrap();
+    let entries = fs.list_directory("").unwrap();
     assert!(entries.is_empty());
 
     // Should fail to read deleted file.
@@ -152,7 +152,7 @@ fn test_delete_empty_directory() {
     fs.create_directory("emptydir").unwrap();
     fs.remove_file("emptydir").unwrap();
 
-    let entries = fs.list_directory().unwrap();
+    let entries = fs.list_directory("").unwrap();
     assert!(entries.is_empty());
 }
 
@@ -198,7 +198,7 @@ fn test_reopen_filesystem() {
         let mut fs = FilesystemCore::new(store.clone(), crypto.clone());
         fs.open().unwrap();
 
-        let entries = fs.list_directory().unwrap();
+        let entries = fs.list_directory("").unwrap();
         assert_eq!(entries.len(), 2);
 
         let data = fs.read_file("persist.txt", 0, 1024).unwrap();
@@ -208,7 +208,7 @@ fn test_reopen_filesystem() {
         fs.create_file("new_after_reopen.txt").unwrap();
         fs.write_file("new_after_reopen.txt", 0, b"fresh").unwrap();
 
-        let entries = fs.list_directory().unwrap();
+        let entries = fs.list_directory("").unwrap();
         assert_eq!(entries.len(), 3);
     }
 
@@ -217,7 +217,7 @@ fn test_reopen_filesystem() {
         let mut fs = FilesystemCore::new(store.clone(), crypto.clone());
         fs.open().unwrap();
 
-        let entries = fs.list_directory().unwrap();
+        let entries = fs.list_directory("").unwrap();
         assert_eq!(entries.len(), 3);
 
         let data = fs.read_file("new_after_reopen.txt", 0, 1024).unwrap();
@@ -367,4 +367,142 @@ fn test_authenticate_proto_roundtrip() {
         }
         _ => panic!("expected Error result"),
     }
+}
+
+// ── Nested directory tests ──
+
+#[test]
+fn test_nested_create_file() {
+    let (mut fs, _, _) = make_fs();
+    fs.create_directory("docs").unwrap();
+    fs.create_file("docs/readme.txt").unwrap();
+    fs.write_file("docs/readme.txt", 0, b"hello nested")
+        .unwrap();
+    let data = fs.read_file("docs/readme.txt", 0, 64).unwrap();
+    assert_eq!(data, b"hello nested");
+}
+
+#[test]
+fn test_nested_list_directory() {
+    let (mut fs, _, _) = make_fs();
+    fs.create_directory("a").unwrap();
+    fs.create_file("a/one.txt").unwrap();
+    fs.create_file("a/two.txt").unwrap();
+
+    let entries = fs.list_directory("a").unwrap();
+    assert_eq!(entries.len(), 2);
+    let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+    assert!(names.contains(&"one.txt"));
+    assert!(names.contains(&"two.txt"));
+}
+
+#[test]
+fn test_deeply_nested_directories() {
+    let (mut fs, _, _) = make_fs();
+    fs.create_directory("a").unwrap();
+    fs.create_directory("a/b").unwrap();
+    fs.create_directory("a/b/c").unwrap();
+    fs.create_file("a/b/c/deep.txt").unwrap();
+    fs.write_file("a/b/c/deep.txt", 0, b"deep data").unwrap();
+
+    let data = fs.read_file("a/b/c/deep.txt", 0, 64).unwrap();
+    assert_eq!(data, b"deep data");
+
+    let entries = fs.list_directory("a/b/c").unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].name, "deep.txt");
+}
+
+#[test]
+fn test_nested_remove_file() {
+    let (mut fs, _, _) = make_fs();
+    fs.create_directory("dir").unwrap();
+    fs.create_file("dir/file.txt").unwrap();
+
+    let entries = fs.list_directory("dir").unwrap();
+    assert_eq!(entries.len(), 1);
+
+    fs.remove_file("dir/file.txt").unwrap();
+    let entries = fs.list_directory("dir").unwrap();
+    assert!(entries.is_empty());
+}
+
+#[test]
+fn test_nested_remove_empty_directory() {
+    let (mut fs, _, _) = make_fs();
+    fs.create_directory("parent").unwrap();
+    fs.create_directory("parent/child").unwrap();
+
+    fs.remove_file("parent/child").unwrap();
+    let entries = fs.list_directory("parent").unwrap();
+    assert!(entries.is_empty());
+}
+
+#[test]
+fn test_nested_remove_nonempty_directory_fails() {
+    let (mut fs, _, _) = make_fs();
+    fs.create_directory("parent").unwrap();
+    fs.create_file("parent/file.txt").unwrap();
+
+    assert!(fs.remove_file("parent").is_err());
+}
+
+#[test]
+fn test_nested_rename() {
+    let (mut fs, _, _) = make_fs();
+    fs.create_directory("dir").unwrap();
+    fs.create_file("dir/old.txt").unwrap();
+    fs.write_file("dir/old.txt", 0, b"content").unwrap();
+
+    fs.rename("dir/old.txt", "dir/new.txt").unwrap();
+
+    assert!(fs.read_file("dir/old.txt", 0, 64).is_err());
+    let data = fs.read_file("dir/new.txt", 0, 64).unwrap();
+    assert_eq!(data, b"content");
+}
+
+#[test]
+fn test_cross_dir_rename_rejected() {
+    let (mut fs, _, _) = make_fs();
+    fs.create_directory("a").unwrap();
+    fs.create_directory("b").unwrap();
+    fs.create_file("a/file.txt").unwrap();
+
+    assert!(fs.rename("a/file.txt", "b/file.txt").is_err());
+}
+
+#[test]
+fn test_create_file_missing_parent_fails() {
+    let (mut fs, _, _) = make_fs();
+    assert!(fs.create_file("nonexistent/file.txt").is_err());
+}
+
+#[test]
+fn test_list_root_via_empty_and_slash() {
+    let (mut fs, _, _) = make_fs();
+    fs.create_file("root.txt").unwrap();
+
+    let e1 = fs.list_directory("").unwrap();
+    let e2 = fs.list_directory("/").unwrap();
+    assert_eq!(e1.len(), 1);
+    assert_eq!(e2.len(), 1);
+    assert_eq!(e1[0].name, "root.txt");
+    assert_eq!(e2[0].name, "root.txt");
+}
+
+#[test]
+fn test_nested_cow_preserves_sibling() {
+    let (mut fs, _, _) = make_fs();
+    fs.create_directory("dir").unwrap();
+    fs.create_file("dir/a.txt").unwrap();
+    fs.create_file("dir/b.txt").unwrap();
+    fs.write_file("dir/a.txt", 0, b"aaa").unwrap();
+    fs.write_file("dir/b.txt", 0, b"bbb").unwrap();
+
+    // Modify one file; the sibling should be unchanged.
+    fs.write_file("dir/a.txt", 0, b"AAA").unwrap();
+    let a = fs.read_file("dir/a.txt", 0, 64).unwrap();
+    let b = fs.read_file("dir/b.txt", 0, 64).unwrap();
+    assert_eq!(a, b"AAA");
+    assert_eq!(b, b"bbb");
 }

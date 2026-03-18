@@ -106,7 +106,7 @@ fn main() {
     println!("Read back: {:?}", String::from_utf8_lossy(&data));
 
     println!("\nListing root directory:");
-    for entry in fs.list_directory().expect("list failed") {
+    for entry in fs.list_directory("").expect("list failed") {
         println!(
             "  {:?}  {:>10} bytes  {}",
             entry.kind, entry.size, entry.name
