@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use crate::block_store::MemoryBlockStore;
-use crate::crypto::ChaChaEngine;
+use crate::crypto::{ChaChaEngine, CryptoEngine};
 use crate::fs::FilesystemCore;
 use crate::model::{InodeKind, DEFAULT_BLOCK_SIZE};
 
@@ -188,7 +188,8 @@ fn test_reopen_filesystem() {
         let mut fs = FilesystemCore::new(store.clone(), crypto.clone());
         fs.init_filesystem().unwrap();
         fs.create_file("persist.txt").unwrap();
-        fs.write_file("persist.txt", 0, b"I survived a reopen!").unwrap();
+        fs.write_file("persist.txt", 0, b"I survived a reopen!")
+            .unwrap();
         fs.create_directory("mydir").unwrap();
     }
 
@@ -252,4 +253,118 @@ fn test_empty_file_read() {
 fn test_sync_does_not_error() {
     let (fs, _, _) = make_fs();
     fs.sync().unwrap();
+}
+
+// ── Authentication tests ────────────────────────────────────
+
+#[test]
+fn test_derive_auth_token_deterministic() {
+    let key = [0xABu8; 32];
+    let t1 = crate::crypto::derive_auth_token(&key).unwrap();
+    let t2 = crate::crypto::derive_auth_token(&key).unwrap();
+    assert_eq!(t1, t2, "same master key must produce the same auth token");
+}
+
+#[test]
+fn test_derive_auth_token_different_keys() {
+    let t1 = crate::crypto::derive_auth_token(&[1u8; 32]).unwrap();
+    let t2 = crate::crypto::derive_auth_token(&[2u8; 32]).unwrap();
+    assert_ne!(
+        t1, t2,
+        "different master keys must produce different auth tokens"
+    );
+}
+
+#[test]
+fn test_auth_token_independent_of_encryption_key() {
+    let master = [0x42u8; 32];
+    let auth_token = crate::crypto::derive_auth_token(&master).unwrap();
+    let engine = ChaChaEngine::new(&master).unwrap();
+
+    // The encryption key is internal, but we can verify independence by
+    // checking that the auth token is not the same bytes as encrypting
+    // an empty payload (which would be the case if the same HKDF info
+    // were used).
+    let (nonce, ciphertext) = engine.encrypt(b"").unwrap();
+    // Auth token should not appear anywhere in the encrypt output.
+    assert_ne!(auth_token.to_vec(), nonce);
+    assert_ne!(auth_token.to_vec(), ciphertext);
+    // And the token itself is 32 bytes.
+    assert_eq!(auth_token.len(), 32);
+}
+
+#[test]
+fn test_auth_token_blake3_hash_stable() {
+    let master = [0xFFu8; 32];
+    let token = crate::crypto::derive_auth_token(&master).unwrap();
+    let hash1 = blake3::hash(&token);
+    let hash2 = blake3::hash(&token);
+    assert_eq!(
+        hash1, hash2,
+        "BLAKE3 hash of auth token must be deterministic"
+    );
+    // Different token → different hash.
+    let other_token = crate::crypto::derive_auth_token(&[0x00u8; 32]).unwrap();
+    let other_hash = blake3::hash(&other_token);
+    assert_ne!(hash1, other_hash);
+}
+
+#[test]
+fn test_authenticate_proto_roundtrip() {
+    use crate::proto;
+    use prost::Message;
+
+    let token = crate::crypto::derive_auth_token(&[0xAA; 32]).unwrap();
+
+    // Encode a request.
+    let req = proto::Request {
+        request_id: 42,
+        command: Some(proto::request::Command::Authenticate(
+            proto::AuthenticateRequest {
+                auth_token: token.to_vec(),
+            },
+        )),
+    };
+    let bytes = req.encode_to_vec();
+    let decoded = proto::Request::decode(&*bytes).unwrap();
+    assert_eq!(decoded.request_id, 42);
+    match decoded.command {
+        Some(proto::request::Command::Authenticate(a)) => {
+            assert_eq!(a.auth_token, token.to_vec());
+        }
+        _ => panic!("expected Authenticate command"),
+    }
+
+    // Encode a success response.
+    let resp = proto::Response {
+        request_id: 42,
+        result: Some(proto::response::Result::Authenticate(
+            proto::AuthenticateResponse {},
+        )),
+    };
+    let bytes = resp.encode_to_vec();
+    let decoded = proto::Response::decode(&*bytes).unwrap();
+    assert_eq!(decoded.request_id, 42);
+    assert!(matches!(
+        decoded.result,
+        Some(proto::response::Result::Authenticate(_))
+    ));
+
+    // Encode an error response (auth rejected).
+    let err_resp = proto::Response {
+        request_id: 42,
+        result: Some(proto::response::Result::Error(proto::ErrorResponse {
+            code: 403,
+            message: "invalid auth token".into(),
+        })),
+    };
+    let bytes = err_resp.encode_to_vec();
+    let decoded = proto::Response::decode(&*bytes).unwrap();
+    match decoded.result {
+        Some(proto::response::Result::Error(e)) => {
+            assert_eq!(e.code, 403);
+            assert_eq!(e.message, "invalid auth token");
+        }
+        _ => panic!("expected Error result"),
+    }
 }

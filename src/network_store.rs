@@ -169,9 +169,12 @@ impl NetworkBlockStore {
         // Establish the initial connection.
         let mut stream = establish_connection(&config, &tls_config)?;
 
+        // Authenticate with the key-derived token.
+        authenticate(&mut stream, &config.auth_token)?;
+
         // Issue GetInfo to learn block geometry.
         let req = proto::Request {
-            request_id: 1,
+            request_id: 2,
             command: Some(proto::request::Command::GetInfo(proto::GetInfoRequest {})),
         };
         send_message(&mut stream, &req)?;
@@ -189,9 +192,6 @@ impl NetworkBlockStore {
             }
             _ => return Err(FsError::Internal("unexpected response to GetInfo".into())),
         };
-
-        // Authenticate with the key-derived token.
-        authenticate(&mut stream, &config.auth_token)?;
 
         Ok(Self {
             config,
