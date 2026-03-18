@@ -2,7 +2,7 @@
 
 A minimal encrypted filesystem core in Rust. All data at rest is encrypted with ChaCha20-Poly1305 AEAD; the backing block store sees only opaque ciphertext. Designed for embedding in desktop and mobile apps via a C ABI (Swift, Kotlin/JNI, etc.) and for use in Rust-based Linux FUSE mounts.
 
-Supports five storage backends: in-memory (for testing), regular files (disk images), raw block devices (e.g. AWS EBS volumes), and **network-backed storage** via mTLS to a [`doublecrypt-server`](https://github.com/doublecrypt/doublecrypt-server) — with an optional write-back LRU cache layer that can sit in front of any backend.
+Supports five storage backends: in-memory (for testing), regular files (disk images), raw block devices (e.g. AWS EBS volumes), and **network-backed storage** via TLS to a [`doublecrypt-server`](https://github.com/doublecrypt/doublecrypt-server) — with an optional write-back LRU cache layer that can sit in front of any backend. Network sessions are authenticated with a token derived from the master encryption key, so anyone who holds the key can connect from any device without managing client certificates.
 
 ## Quick Start
 
@@ -203,20 +203,20 @@ cached.sync()?;                 // batch-flush to inner store
 
 The cache uses `write_blocks()` during `sync()`, so a `NetworkBlockStore` underneath benefits from pipelined batch writes.
 
-### `network_store` — Remote mTLS block store _(feature: `network`)_
+### `network_store` — Remote TLS block store _(feature: `network`)_
 
-`NetworkBlockStore` connects to a [`doublecrypt-server`](https://github.com/doublecrypt/doublecrypt-server) over mutual TLS using a 4-byte little-endian length-prefixed protobuf protocol.
+`NetworkBlockStore` connects to a [`doublecrypt-server`](https://github.com/doublecrypt/doublecrypt-server) over TLS using a 4-byte little-endian length-prefixed protobuf protocol. After the TLS handshake the client authenticates with a token derived from the master key (see [`derive_auth_token`](#authentication)).
 
 ```rust
 use std::path::Path;
 use doublecrypt_core::network_store::NetworkBlockStore;
 
+let master_key = [0u8; 32];
 let store = NetworkBlockStore::connect(
     "10.0.0.5:9100",
     "block-server",
-    Path::new("certs/client.pem"),
-    Path::new("certs/client-key.pem"),
     Path::new("certs/ca.pem"),
+    &master_key,
 )?;
 ```
 
@@ -226,11 +226,11 @@ Or with the builder for full control:
 use std::time::Duration;
 use doublecrypt_core::network_store::{NetworkBlockStore, NetworkBlockStoreConfig};
 
+let master_key = [0u8; 32];
 let store = NetworkBlockStore::from_config(
     NetworkBlockStoreConfig::new("10.0.0.5:9100", "block-server")
-        .client_cert("certs/client.pem")
-        .client_key("certs/client-key.pem")
         .ca_cert("certs/ca.pem")
+        .auth_token(&master_key)
         .connect_timeout(Duration::from_secs(5))
         .io_timeout(Duration::from_secs(60)),
 )?;
@@ -238,8 +238,9 @@ let store = NetworkBlockStore::from_config(
 
 **Features:**
 
+- **Key-derived authentication** — the master key is used to derive an auth token via HKDF. The server stores only a hash of this token, never the encryption key.
 - **Request pipelining** — `read_blocks()`/`write_blocks()` send a full batch of requests before reading any responses (up to 64 at a time).
-- **Automatic reconnection** — one transparent retry with a fresh TLS handshake on I/O failure.
+- **Automatic reconnection** — one transparent retry with a fresh TLS handshake + re-authentication on I/O failure.
 - **Configurable timeouts** — connect timeout (default 10 s) and I/O timeout (default 30 s).
 
 **Typical production setup** (network + cache):
@@ -251,7 +252,7 @@ use doublecrypt_core::cached_store::CachedBlockStore;
 use doublecrypt_core::crypto::ChaChaEngine;
 use doublecrypt_core::fs::FilesystemCore;
 
-let net = NetworkBlockStore::connect(addr, sni, cert, key, ca)?;
+let net = NetworkBlockStore::connect(addr, sni, ca, &master_key)?;
 let store = Arc::new(CachedBlockStore::new(net, 1024));
 let crypto = Arc::new(ChaChaEngine::new(&master_key)?);
 let mut fs = FilesystemCore::new(store, crypto);
@@ -264,19 +265,21 @@ The `proto` module contains hand-written [prost](https://crates.io/crates/prost)
 
 **Key types:**
 
-| Type                 | Purpose                                               |
-| -------------------- | ----------------------------------------------------- |
-| `Request`            | Top-level message: one-of `Command` variants          |
-| `Response`           | Top-level message: one-of `Result` variants           |
-| `request::Command`   | `ReadBlock`, `WriteBlock`, `Sync`, `GetInfo`          |
-| `response::Result`   | `ReadBlock`, `WriteBlock`, `Sync`, `GetInfo`, `Error` |
-| `ReadBlockRequest`   | `block_id: u64`                                       |
-| `ReadBlockResponse`  | `block_id: u64`, `data: Vec<u8>`                      |
-| `WriteBlockRequest`  | `block_id: u64`, `data: Vec<u8>`                      |
-| `WriteBlockResponse` | _(empty — success acknowledgement)_                   |
-| `SyncResponse`       | _(empty — success acknowledgement)_                   |
-| `GetInfoResponse`    | `block_size: u64`, `total_blocks: u64`                |
-| `ErrorResponse`      | `code: i32`, `message: String`                        |
+| Type                   | Purpose                                                               |
+| ---------------------- | --------------------------------------------------------------------- |
+| `Request`              | Top-level message: one-of `Command` variants                          |
+| `Response`             | Top-level message: one-of `Result` variants                           |
+| `request::Command`     | `ReadBlock`, `WriteBlock`, `Sync`, `GetInfo`, `Authenticate`          |
+| `response::Result`     | `ReadBlock`, `WriteBlock`, `Sync`, `GetInfo`, `Error`, `Authenticate` |
+| `ReadBlockRequest`     | `block_id: u64`                                                       |
+| `ReadBlockResponse`    | `block_id: u64`, `data: Vec<u8>`                                      |
+| `WriteBlockRequest`    | `block_id: u64`, `data: Vec<u8>`                                      |
+| `WriteBlockResponse`   | _(empty — success acknowledgement)_                                   |
+| `SyncResponse`         | _(empty — success acknowledgement)_                                   |
+| `GetInfoResponse`      | `block_size: u64`, `total_blocks: u64`                                |
+| `AuthenticateRequest`  | `auth_token: Vec<u8>` (32-byte HKDF-derived token)                    |
+| `AuthenticateResponse` | _(empty — success acknowledgement)_                                   |
+| `ErrorResponse`        | `code: i32`, `message: String`                                        |
 
 See [Sharing protocol types](#sharing-protocol-types-with-doublecrypt-server) in the Features section for cross-crate usage.
 
@@ -321,6 +324,19 @@ let engine = ChaChaEngine::generate()?;
 | Auth tag  | 128-bit (appended to ciphertext by AEAD)                                            |
 
 The derived key is zeroized on drop.
+
+<a id="authentication"></a>
+**`derive_auth_token`** — derives a 32-byte auth token from the same master key using a separate HKDF info string (`"server-auth-token"`). This token is cryptographically independent of the encryption key — learning it reveals nothing about the key used to encrypt blocks.
+
+```rust
+use doublecrypt_core::crypto::derive_auth_token;
+
+let auth_token: [u8; 32] = derive_auth_token(&master_key)?;
+// Send to server via Authenticate RPC.
+// Server stores BLAKE3(auth_token) and compares on connect.
+```
+
+This means the master key is the **only secret** needed to both encrypt data and authenticate to the server. Two users who share a master key can connect from different devices without exchanging client certificates.
 
 **Helper functions:**
 
@@ -502,7 +518,7 @@ envelope = EncryptedObject { kind, version, nonce: [u8;12], ciphertext }
 
 | Feature   | Default | What it enables                                      |
 | --------- | ------- | ---------------------------------------------------- |
-| `network` | **yes** | `NetworkBlockStore` (rustls mTLS client)             |
+| `network` | **yes** | `NetworkBlockStore` (rustls TLS client)              |
 | _(none)_  | always  | `proto` module (prost structs for the wire protocol) |
 
 ```toml
@@ -607,8 +623,6 @@ Connect to a remote `doublecrypt-server` (network-backed):
 cargo run --example network_mount -- \
     --addr 10.0.0.5:9100 \
     --server-name block-server \
-    --cert certs/client.pem \
-    --key certs/client-key.pem \
     --ca certs/ca.pem \
     --master-key 0000000000000000000000000000000000000000000000000000000000000000
 ```

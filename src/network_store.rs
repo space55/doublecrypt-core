@@ -1,4 +1,4 @@
-//! Network-backed block store that connects to a `doublecrypt-server` over mTLS.
+//! Network-backed block store that connects to a `doublecrypt-server` over TLS.
 //!
 //! Uses the 4-byte little-endian length-prefixed protobuf protocol defined in
 //! `proto/blockstore.proto`.  The connection is synchronous (matching the
@@ -8,8 +8,12 @@
 //!   [`write_blocks`](BlockStore::write_blocks) send a full batch of requests
 //!   before reading any responses, eliminating per-block round-trip latency.
 //! * **Automatic reconnection** — a single retry on I/O failure with a fresh
-//!   TLS handshake.
+//!   TLS handshake (re-authenticates automatically).
 //! * **Configurable timeouts** — connect, read, and write deadlines.
+//! * **Key-derived authentication** — after the TLS handshake, the client sends
+//!   an `Authenticate` request containing a token derived from the master key
+//!   via HKDF (see [`derive_auth_token`](crate::crypto::derive_auth_token)).
+//!   This proves possession of the encryption key without revealing it.
 //!
 //! # Quick start
 //!
@@ -18,12 +22,12 @@
 //! use doublecrypt_core::network_store::NetworkBlockStore;
 //! use doublecrypt_core::block_store::BlockStore;
 //!
+//! let master_key = [0u8; 32];
 //! let store = NetworkBlockStore::connect(
 //!     "127.0.0.1:9100",
 //!     "localhost",
-//!     Path::new("certs/client.pem"),
-//!     Path::new("certs/client-key.pem"),
 //!     Path::new("certs/ca.pem"),
+//!     &master_key,
 //! ).expect("connect to server");
 //!
 //! let data = store.read_block(0).expect("read block 0");
@@ -36,11 +40,11 @@
 //! use doublecrypt_core::network_store::{NetworkBlockStore, NetworkBlockStoreConfig};
 //! use doublecrypt_core::block_store::BlockStore;
 //!
+//! let master_key = [0u8; 32];
 //! let store = NetworkBlockStore::from_config(
 //!     NetworkBlockStoreConfig::new("10.0.0.5:9100", "block-server")
-//!         .client_cert("certs/client.pem")
-//!         .client_key("certs/client-key.pem")
 //!         .ca_cert("certs/ca.pem")
+//!         .auth_token(&master_key)
 //!         .connect_timeout(Duration::from_secs(5))
 //!         .io_timeout(Duration::from_secs(60)),
 //! ).expect("connect to server");
@@ -54,10 +58,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use prost::Message;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::{ClientConfig, ClientConnection, StreamOwned};
 
 use crate::block_store::BlockStore;
+use crate::crypto;
 use crate::error::{FsError, FsResult};
 use crate::proto;
 
@@ -73,9 +78,8 @@ const PIPELINE_BATCH: usize = 64;
 pub struct NetworkBlockStoreConfig {
     addr: String,
     server_name: String,
-    client_cert: PathBuf,
-    client_key: PathBuf,
     ca_cert: PathBuf,
+    auth_token: [u8; 32],
     connect_timeout: Duration,
     io_timeout: Duration,
 }
@@ -87,26 +91,28 @@ impl NetworkBlockStoreConfig {
         Self {
             addr: addr.into(),
             server_name: server_name.into(),
-            client_cert: PathBuf::new(),
-            client_key: PathBuf::new(),
             ca_cert: PathBuf::new(),
+            auth_token: [0u8; 32],
             connect_timeout: Duration::from_secs(10),
             io_timeout: Duration::from_secs(30),
         }
     }
 
-    pub fn client_cert(mut self, path: impl Into<PathBuf>) -> Self {
-        self.client_cert = path.into();
-        self
-    }
-
-    pub fn client_key(mut self, path: impl Into<PathBuf>) -> Self {
-        self.client_key = path.into();
-        self
-    }
-
     pub fn ca_cert(mut self, path: impl Into<PathBuf>) -> Self {
         self.ca_cert = path.into();
+        self
+    }
+
+    /// Set the auth token by deriving it from the given master key.
+    pub fn auth_token(mut self, master_key: &[u8]) -> Self {
+        self.auth_token = crypto::derive_auth_token(master_key)
+            .expect("HKDF auth-token derivation should not fail with valid key material");
+        self
+    }
+
+    /// Set a pre-derived auth token directly.
+    pub fn auth_token_raw(mut self, token: [u8; 32]) -> Self {
+        self.auth_token = token;
         self
     }
 
@@ -123,11 +129,14 @@ impl NetworkBlockStoreConfig {
 
 // ── Store ───────────────────────────────────────────────────
 
-/// A [`BlockStore`] backed by a remote `doublecrypt-server` reached over mTLS.
+/// A [`BlockStore`] backed by a remote `doublecrypt-server` reached over TLS
+/// with key-derived authentication.
 ///
-/// On construction the client performs a TLS handshake and issues a `GetInfo`
-/// RPC to learn the block size and total block count.  The connection is
-/// stored and reused; if it breaks, one automatic reconnect is attempted.
+/// On construction the client performs a TLS handshake, issues a `GetInfo`
+/// RPC to learn the block size and total block count, then sends an
+/// `Authenticate` request with a token derived from the master key.
+/// The connection is stored and reused; if it breaks, one automatic
+/// reconnect (including re-authentication) is attempted.
 pub struct NetworkBlockStore {
     config: NetworkBlockStoreConfig,
     tls_config: Arc<ClientConfig>,
@@ -138,27 +147,24 @@ pub struct NetworkBlockStore {
 }
 
 impl NetworkBlockStore {
-    /// Connect to a `doublecrypt-server` using mutual TLS (convenience wrapper
-    /// around [`from_config`](Self::from_config)).
+    /// Connect to a `doublecrypt-server` using TLS with key-derived
+    /// authentication (convenience wrapper around [`from_config`](Self::from_config)).
     pub fn connect(
         addr: &str,
         server_name: &str,
-        client_cert: &Path,
-        client_key: &Path,
         ca_cert: &Path,
+        master_key: &[u8],
     ) -> FsResult<Self> {
         Self::from_config(
             NetworkBlockStoreConfig::new(addr, server_name)
-                .client_cert(client_cert)
-                .client_key(client_key)
-                .ca_cert(ca_cert),
+                .ca_cert(ca_cert)
+                .auth_token(master_key),
         )
     }
 
     /// Connect using a [`NetworkBlockStoreConfig`].
     pub fn from_config(config: NetworkBlockStoreConfig) -> FsResult<Self> {
-        let tls_config =
-            build_client_tls_config(&config.client_cert, &config.client_key, &config.ca_cert)?;
+        let tls_config = build_client_tls_config(&config.ca_cert)?;
 
         // Establish the initial connection.
         let mut stream = establish_connection(&config, &tls_config)?;
@@ -171,21 +177,30 @@ impl NetworkBlockStore {
         send_message(&mut stream, &req)?;
         let resp = recv_message(&mut stream)?;
 
-        match resp.result {
-            Some(proto::response::Result::GetInfo(info)) => Ok(Self {
-                config,
-                tls_config,
-                stream: Mutex::new(Some(stream)),
-                block_size: info.block_size as usize,
-                total_blocks: info.total_blocks,
-                next_request_id: AtomicU64::new(2),
-            }),
-            Some(proto::response::Result::Error(e)) => Err(FsError::Internal(format!(
-                "server error on GetInfo: {}",
-                e.message
-            ))),
-            _ => Err(FsError::Internal("unexpected response to GetInfo".into())),
-        }
+        let (block_size, total_blocks) = match resp.result {
+            Some(proto::response::Result::GetInfo(info)) => {
+                (info.block_size as usize, info.total_blocks)
+            }
+            Some(proto::response::Result::Error(e)) => {
+                return Err(FsError::Internal(format!(
+                    "server error on GetInfo: {}",
+                    e.message
+                )))
+            }
+            _ => return Err(FsError::Internal("unexpected response to GetInfo".into())),
+        };
+
+        // Authenticate with the key-derived token.
+        authenticate(&mut stream, &config.auth_token)?;
+
+        Ok(Self {
+            config,
+            tls_config,
+            stream: Mutex::new(Some(stream)),
+            block_size,
+            total_blocks,
+            next_request_id: AtomicU64::new(3),
+        })
     }
 
     /// Allocate a monotonically increasing request ID.
@@ -193,9 +208,12 @@ impl NetworkBlockStore {
         self.next_request_id.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Establish a fresh TLS connection using stored config.
+    /// Establish a fresh TLS connection using stored config, including
+    /// re-authentication.
     fn reconnect(&self) -> FsResult<StreamOwned<ClientConnection, TcpStream>> {
-        establish_connection(&self.config, &self.tls_config)
+        let mut stream = establish_connection(&self.config, &self.tls_config)?;
+        authenticate(&mut stream, &self.config.auth_token)?;
+        Ok(stream)
     }
 
     /// Send a single request and receive its response, retrying once on I/O
@@ -407,6 +425,36 @@ impl BlockStore for NetworkBlockStore {
     }
 }
 
+// ── Authentication ──────────────────────────────────────────
+
+/// Send an Authenticate request and verify the server accepts it.
+fn authenticate(
+    stream: &mut StreamOwned<ClientConnection, TcpStream>,
+    auth_token: &[u8; 32],
+) -> FsResult<()> {
+    let req = proto::Request {
+        request_id: 2,
+        command: Some(proto::request::Command::Authenticate(
+            proto::AuthenticateRequest {
+                auth_token: auth_token.to_vec(),
+            },
+        )),
+    };
+    send_message(stream, &req)?;
+    let resp = recv_message(stream)?;
+
+    match resp.result {
+        Some(proto::response::Result::Authenticate(_)) => Ok(()),
+        Some(proto::response::Result::Error(e)) => Err(FsError::Internal(format!(
+            "authentication failed: {}",
+            e.message
+        ))),
+        _ => Err(FsError::Internal(
+            "unexpected response to Authenticate".into(),
+        )),
+    }
+}
+
 // ── Wire helpers ────────────────────────────────────────────
 
 fn send_message<W: Write>(w: &mut W, msg: &proto::Request) -> FsResult<()> {
@@ -480,24 +528,7 @@ fn establish_connection(
 
 // ── TLS configuration ───────────────────────────────────────
 
-fn build_client_tls_config(
-    cert_path: &Path,
-    key_path: &Path,
-    ca_path: &Path,
-) -> FsResult<Arc<ClientConfig>> {
-    let cert_pem = std::fs::read(cert_path)
-        .map_err(|e| FsError::Internal(format!("read client cert {}: {e}", cert_path.display())))?;
-    let certs: Vec<CertificateDer<'static>> =
-        rustls_pemfile::certs(&mut BufReader::new(&*cert_pem))
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|e| FsError::Internal(format!("parse client certs: {e}")))?;
-
-    let key_pem = std::fs::read(key_path)
-        .map_err(|e| FsError::Internal(format!("read client key {}: {e}", key_path.display())))?;
-    let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut BufReader::new(&*key_pem))
-        .map_err(|e| FsError::Internal(format!("parse client key: {e}")))?
-        .ok_or_else(|| FsError::Internal("no private key found in PEM file".into()))?;
-
+fn build_client_tls_config(ca_path: &Path) -> FsResult<Arc<ClientConfig>> {
     let ca_pem = std::fs::read(ca_path)
         .map_err(|e| FsError::Internal(format!("read CA cert {}: {e}", ca_path.display())))?;
     let ca_certs: Vec<CertificateDer<'static>> =
@@ -514,8 +545,7 @@ fn build_client_tls_config(
 
     let config = ClientConfig::builder()
         .with_root_certificates(root_store)
-        .with_client_auth_cert(certs, key)
-        .map_err(|e| FsError::Internal(format!("build TLS client config: {e}")))?;
+        .with_no_client_auth();
 
     Ok(Arc::new(config))
 }

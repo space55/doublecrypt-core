@@ -79,6 +79,20 @@ impl Drop for ChaChaEngine {
     }
 }
 
+/// Derive a 32-byte auth token from a master key using HKDF-SHA256.
+///
+/// The token is derived with a distinct info string (`"server-auth-token"`),
+/// making it cryptographically independent of the encryption key derived by
+/// [`ChaChaEngine::new`]. The server stores `BLAKE3(token)` and never learns
+/// the encryption key.
+pub fn derive_auth_token(master_key: &[u8]) -> FsResult<[u8; 32]> {
+    let hk = Hkdf::<Sha256>::new(Some(b"doublecrypt-v1"), master_key);
+    let mut token = [0u8; 32];
+    hk.expand(b"server-auth-token", &mut token)
+        .map_err(|e| FsError::Encryption(format!("HKDF auth-token derivation failed: {e}")))?;
+    Ok(token)
+}
+
 /// Encrypt a logical object payload into an EncryptedObject envelope.
 pub fn encrypt_object(
     engine: &dyn CryptoEngine,
@@ -97,10 +111,7 @@ pub fn encrypt_object(
 }
 
 /// Decrypt an EncryptedObject envelope back to plaintext bytes.
-pub fn decrypt_object(
-    engine: &dyn CryptoEngine,
-    obj: &EncryptedObject,
-) -> FsResult<Vec<u8>> {
+pub fn decrypt_object(engine: &dyn CryptoEngine, obj: &EncryptedObject) -> FsResult<Vec<u8>> {
     engine.decrypt(&obj.nonce, &obj.ciphertext)
 }
 

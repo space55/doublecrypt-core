@@ -1,12 +1,11 @@
-//! Connects to a `doublecrypt-server` over mTLS, mounts a network-backed
-//! encrypted filesystem with a write-back cache, and performs basic operations.
+//! Connects to a `doublecrypt-server` over TLS, authenticates with a
+//! key-derived token, mounts a network-backed encrypted filesystem with a
+//! write-back cache, and performs basic operations.
 //!
 //! Run with:
 //!   cargo run --example network_mount -- \
 //!       --addr 127.0.0.1:9100 \
 //!       --server-name localhost \
-//!       --cert certs/client.pem \
-//!       --key certs/client-key.pem \
 //!       --ca certs/ca.pem \
 //!       --master-key 0000000000000000000000000000000000000000000000000000000000000000
 
@@ -24,8 +23,6 @@ fn main() {
 
     let mut addr = "127.0.0.1:9100";
     let mut server_name = "localhost";
-    let mut cert = "certs/client.pem";
-    let mut key = "certs/client-key.pem";
     let mut ca = "certs/ca.pem";
     let mut master_key_hex = "";
     let mut init = false;
@@ -39,14 +36,6 @@ fn main() {
             }
             "--server-name" => {
                 server_name = &args[i + 1];
-                i += 2;
-            }
-            "--cert" => {
-                cert = &args[i + 1];
-                i += 2;
-            }
-            "--key" => {
-                key = &args[i + 1];
                 i += 2;
             }
             "--ca" => {
@@ -79,14 +68,8 @@ fn main() {
 
     // ── Connect ─────────────────────────────────────────────
     println!("Connecting to {addr} (SNI: {server_name})...");
-    let net = NetworkBlockStore::connect(
-        addr,
-        server_name,
-        Path::new(cert),
-        Path::new(key),
-        Path::new(ca),
-    )
-    .expect("failed to connect to server");
+    let net = NetworkBlockStore::connect(addr, server_name, Path::new(ca), &master_key)
+        .expect("failed to connect to server");
 
     println!(
         "Connected: {} blocks × {} bytes ({} MiB)",

@@ -23,7 +23,7 @@
 pub struct Request {
     #[prost(uint64, tag = "1")]
     pub request_id: u64,
-    #[prost(oneof = "request::Command", tags = "2, 3, 4, 5")]
+    #[prost(oneof = "request::Command", tags = "2, 3, 4, 5, 6")]
     pub command: ::core::option::Option<request::Command>,
 }
 
@@ -38,6 +38,8 @@ pub mod request {
         Sync(super::SyncRequest),
         #[prost(message, tag = "5")]
         GetInfo(super::GetInfoRequest),
+        #[prost(message, tag = "6")]
+        Authenticate(super::AuthenticateRequest),
     }
 }
 
@@ -61,13 +63,20 @@ pub struct SyncRequest {}
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct GetInfoRequest {}
 
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AuthenticateRequest {
+    /// HKDF-derived auth token (32 bytes, independent of the encryption key).
+    #[prost(bytes = "vec", tag = "1")]
+    pub auth_token: Vec<u8>,
+}
+
 // ── Responses ───────────────────────────────────────────────
 
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Response {
     #[prost(uint64, tag = "1")]
     pub request_id: u64,
-    #[prost(oneof = "response::Result", tags = "2, 3, 4, 5, 6")]
+    #[prost(oneof = "response::Result", tags = "2, 3, 4, 5, 6, 7")]
     pub result: ::core::option::Option<response::Result>,
 }
 
@@ -84,6 +93,8 @@ pub mod response {
         GetInfo(super::GetInfoResponse),
         #[prost(message, tag = "6")]
         Error(super::ErrorResponse),
+        #[prost(message, tag = "7")]
+        Authenticate(super::AuthenticateResponse),
     }
 }
 
@@ -106,6 +117,9 @@ pub struct GetInfoResponse {
     #[prost(uint64, tag = "2")]
     pub total_blocks: u64,
 }
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AuthenticateResponse {}
 
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ErrorResponse {

@@ -14,6 +14,7 @@ message Request {
     WriteBlockRequest write_block = 3;
     SyncRequest sync = 4;
     GetInfoRequest get_info = 5;
+    AuthenticateRequest authenticate = 6;
   }
 }
 
@@ -30,6 +31,10 @@ message SyncRequest {}
 
 message GetInfoRequest {}
 
+message AuthenticateRequest {
+  bytes auth_token = 1;
+}
+
 // ── Responses ───────────────────────────────────────────────
 
 message Response {
@@ -40,6 +45,7 @@ message Response {
     SyncResponse sync = 4;
     GetInfoResponse get_info = 5;
     ErrorResponse error = 6;
+    AuthenticateResponse authenticate = 7;
   }
 }
 
@@ -60,3 +66,5 @@ message ErrorResponse {
   int32 code = 1;
   string message = 2;
 }
+
+message AuthenticateResponse {}
