@@ -45,10 +45,9 @@ struct AncestorEntry {
 
 /// Tracks in-memory buffered writes for a single file.
 ///
-/// Full chunks (size == `max_chunk_payload`) are eagerly written to the
-/// block store and removed from `dirty_chunks`, keeping only partial /
-/// in-progress chunks in memory.  The metadata commit (extent map, inode,
-/// CoW chain) is deferred to `sync()` or the next metadata operation.
+/// All dirty chunks are held in memory until `sync()` (or the next
+/// metadata-mutating operation) flushes them to the block store.
+/// This keeps `write_file()` purely in-memory for smooth throughput.
 struct DirtyFile {
     /// In-memory chunk data keyed by chunk index (only partial chunks).
     dirty_chunks: HashMap<u64, Vec<u8>>,
@@ -381,9 +380,9 @@ impl FilesystemCore {
     /// Write data to a file at the given path.
     ///
     /// Writes are buffered in memory and only flushed to the block store on
-    /// `sync()`, when another metadata operation occurs, or when the total
-    /// buffer exceeds ~16 MiB.  This turns many small sequential writes
-    /// (e.g. `dd bs=1k`) into a single bulk commit.
+    /// `sync()` or when another metadata-mutating operation occurs.
+    /// This keeps every `write_file` call purely in-memory for smooth
+    /// throughput.  Call `sync()` periodically to bound memory usage.
     pub fn write_file(&mut self, path: &str, offset: u64, data: &[u8]) -> FsResult<()> {
         if data.is_empty() {
             return Ok(());
@@ -490,44 +489,6 @@ impl FilesystemCore {
         dirty.size = new_size as u64;
         dirty.metadata_dirty = true;
 
-        // Eagerly flush any full chunks to the block store so the in-memory
-        // buffer stays small.  The extent map is updated in-place; the
-        // metadata commit is deferred to sync().
-        let mut to_flush: Vec<u64> = Vec::new();
-        for (&idx, buf) in dirty.dirty_chunks.iter() {
-            if buf.len() >= chunk_size {
-                to_flush.push(idx);
-            }
-        }
-        for idx in to_flush {
-            let chunk_data = dirty.dirty_chunks.remove(&idx).unwrap();
-            let data_block = self.allocator.allocate()?;
-            write_encrypted_raw(
-                self.store.as_ref(),
-                self.crypto.as_ref(),
-                &self.codec,
-                data_block,
-                ObjectKind::FileDataChunk,
-                &chunk_data,
-            )?;
-            if let Some(entry) = dirty
-                .extent_map
-                .entries
-                .iter_mut()
-                .find(|e| e.chunk_index == idx)
-            {
-                entry.data_ref = ObjectRef::new(data_block);
-                entry.plaintext_len = chunk_data.len() as u32;
-            } else {
-                dirty.extent_map.entries.push(ExtentEntry {
-                    chunk_index: idx,
-                    data_ref: ObjectRef::new(data_block),
-                    plaintext_len: chunk_data.len() as u32,
-                });
-            }
-        }
-
-        dirty.extent_map.entries.sort_by_key(|e| e.chunk_index);
         self.write_buffer.insert(path_key, dirty);
         Ok(())
     }
