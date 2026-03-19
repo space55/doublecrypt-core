@@ -43,22 +43,23 @@ struct AncestorEntry {
     child_index: usize,
 }
 
-/// Default write buffer limit before auto-flush (16 MiB).
-const WRITE_BUFFER_LIMIT: usize = 16 * 1024 * 1024;
-
 /// Tracks in-memory buffered writes for a single file.
-/// Dirty chunks are held in memory and flushed to the block store
-/// on `sync()`, when another metadata operation occurs, or when the
-/// total buffer size exceeds `WRITE_BUFFER_LIMIT`.
+///
+/// Full chunks (size == `max_chunk_payload`) are eagerly written to the
+/// block store and removed from `dirty_chunks`, keeping only partial /
+/// in-progress chunks in memory.  The metadata commit (extent map, inode,
+/// CoW chain) is deferred to `sync()` or the next metadata operation.
 struct DirtyFile {
-    /// In-memory chunk data keyed by chunk index.
+    /// In-memory chunk data keyed by chunk index (only partial chunks).
     dirty_chunks: HashMap<u64, Vec<u8>>,
     /// The file's inode at the time buffering started.
     base_inode: Inode,
-    /// The file's extent map (disk snapshot; updated with new entries on flush).
+    /// The file's extent map (updated in-place when chunks are eagerly flushed).
     extent_map: ExtentMap,
     /// Current logical file size (updated on every write).
     size: u64,
+    /// Set to `true` when any data has been written (even if eagerly flushed).
+    metadata_dirty: bool,
 }
 
 /// Maximum payload size for a single file data chunk.
@@ -422,6 +423,7 @@ impl FilesystemCore {
                     base_inode: file_inode.clone(),
                     extent_map,
                     size: file_inode.size,
+                    metadata_dirty: false,
                 }
             }
         };
@@ -486,19 +488,47 @@ impl FilesystemCore {
         }
 
         dirty.size = new_size as u64;
-        self.write_buffer.insert(path_key, dirty);
+        dirty.metadata_dirty = true;
 
-        // Auto-flush if total buffered data exceeds the threshold.
-        let total_buffered: usize = self
-            .write_buffer
-            .values()
-            .flat_map(|d| d.dirty_chunks.values())
-            .map(|v| v.len())
-            .sum();
-        if total_buffered > WRITE_BUFFER_LIMIT {
-            self.flush_all()?;
+        // Eagerly flush any full chunks to the block store so the in-memory
+        // buffer stays small.  The extent map is updated in-place; the
+        // metadata commit is deferred to sync().
+        let mut to_flush: Vec<u64> = Vec::new();
+        for (&idx, buf) in dirty.dirty_chunks.iter() {
+            if buf.len() >= chunk_size {
+                to_flush.push(idx);
+            }
+        }
+        for idx in to_flush {
+            let chunk_data = dirty.dirty_chunks.remove(&idx).unwrap();
+            let data_block = self.allocator.allocate()?;
+            write_encrypted_raw(
+                self.store.as_ref(),
+                self.crypto.as_ref(),
+                &self.codec,
+                data_block,
+                ObjectKind::FileDataChunk,
+                &chunk_data,
+            )?;
+            if let Some(entry) = dirty
+                .extent_map
+                .entries
+                .iter_mut()
+                .find(|e| e.chunk_index == idx)
+            {
+                entry.data_ref = ObjectRef::new(data_block);
+                entry.plaintext_len = chunk_data.len() as u32;
+            } else {
+                dirty.extent_map.entries.push(ExtentEntry {
+                    chunk_index: idx,
+                    data_ref: ObjectRef::new(data_block),
+                    plaintext_len: chunk_data.len() as u32,
+                });
+            }
         }
 
+        dirty.extent_map.entries.sort_by_key(|e| e.chunk_index);
+        self.write_buffer.insert(path_key, dirty);
         Ok(())
     }
 
@@ -724,7 +754,7 @@ impl FilesystemCore {
             None => return Ok(()),
         };
 
-        if dirty.dirty_chunks.is_empty() {
+        if !dirty.metadata_dirty {
             return Ok(());
         }
 
