@@ -53,6 +53,8 @@ impl TransactionManager {
     ///
     /// Note: root pointers are written unencrypted but with a checksum.
     /// The superblock itself is encrypted.
+    ///
+    /// Returns the block ID allocated for the superblock object.
     pub fn commit(
         &mut self,
         store: &dyn BlockStore,
@@ -60,7 +62,7 @@ impl TransactionManager {
         codec: &PostcardCodec,
         allocator: &dyn SlotAllocator,
         superblock: &Superblock,
-    ) -> FsResult<()> {
+    ) -> FsResult<u64> {
         self.generation += 1;
 
         // 1. Allocate a block for the superblock object.
@@ -103,7 +105,7 @@ impl TransactionManager {
         store.write_block(slot, &block)?;
 
         self.next_is_b = !self.next_is_b;
-        Ok(())
+        Ok(sb_block)
     }
 
     /// Try to read a root pointer from a slot. Returns None if the slot is empty/invalid.

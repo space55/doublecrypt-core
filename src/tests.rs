@@ -464,13 +464,20 @@ fn test_nested_rename() {
 }
 
 #[test]
-fn test_cross_dir_rename_rejected() {
+fn test_cross_dir_rename() {
     let (mut fs, _, _) = make_fs();
     fs.create_directory("a").unwrap();
     fs.create_directory("b").unwrap();
     fs.create_file("a/file.txt").unwrap();
+    fs.write_file("a/file.txt", 0, b"hello cross").unwrap();
+    fs.sync().unwrap();
 
-    assert!(fs.rename("a/file.txt", "b/file.txt").is_err());
+    fs.rename("a/file.txt", "b/file.txt").unwrap();
+
+    // Source gone, destination readable with same content.
+    assert!(fs.read_file("a/file.txt", 0, 1).is_err());
+    let data = fs.read_file("b/file.txt", 0, 20).unwrap();
+    assert_eq!(data, b"hello cross");
 }
 
 #[test]
@@ -619,4 +626,267 @@ fn test_write_with_gap_fills_zeros() {
 
     let tail = fs.read_file("sparse.bin", 200_000, 4).unwrap();
     assert_eq!(tail, b"TAIL");
+}
+
+// ── Garbage collection tests ──
+
+#[test]
+fn test_gc_overwrite_reclaims_blocks() {
+    let (mut fs, _store, _crypto) = make_fs();
+    fs.create_file("a.txt").unwrap();
+    fs.write_file("a.txt", 0, &[0xAA; 80_000]).unwrap();
+    fs.sync().unwrap();
+
+    let free_before = fs.free_block_count();
+
+    // Overwrite with same size data — old data chunks + metadata should be freed.
+    fs.write_file("a.txt", 0, &[0xBB; 80_000]).unwrap();
+    fs.sync().unwrap();
+
+    let free_after = fs.free_block_count();
+    // After GC, free count should be similar (not monotonically decreasing).
+    // The overwrite allocates new blocks but frees old ones, so free count
+    // should stay roughly the same (within a small delta for metadata churn).
+    let delta = (free_before as i64 - free_after as i64).unsigned_abs();
+    assert!(
+        delta <= 2,
+        "free blocks should be ~stable after overwrite, delta={delta}"
+    );
+}
+
+#[test]
+fn test_gc_delete_reclaims_all_blocks() {
+    let (mut fs, _store, _crypto) = make_fs();
+    let free_initial = fs.free_block_count();
+
+    fs.create_file("big.bin").unwrap();
+    fs.write_file("big.bin", 0, &[0xCC; 200_000]).unwrap();
+    fs.sync().unwrap();
+    let free_after_write = fs.free_block_count();
+
+    // File consumes several blocks — free count should have dropped.
+    assert!(
+        free_after_write < free_initial,
+        "creating a file should consume blocks"
+    );
+
+    fs.remove_file("big.bin").unwrap();
+    let free_after_delete = fs.free_block_count();
+
+    // Deleting should reclaim most blocks (inode, extent map, data chunks).
+    // It won't be exactly equal to initial because the superblock/root inode
+    // metadata is still allocated, but should be very close.
+    let reclaimed = free_after_delete as i64 - free_after_write as i64;
+    assert!(
+        reclaimed > 0,
+        "deleting a file should reclaim blocks, but got delta={reclaimed}"
+    );
+    let gap = free_initial as i64 - free_after_delete as i64;
+    assert!(
+        gap <= 2,
+        "after delete, free count should be close to initial, gap={gap}"
+    );
+}
+
+#[test]
+fn test_gc_create_delete_cycle_does_not_exhaust() {
+    let (mut fs, _store, _crypto) = make_fs();
+    let free_initial = fs.free_block_count();
+
+    for i in 0..50 {
+        let name = format!("file_{i}.dat");
+        fs.create_file(&name).unwrap();
+        fs.write_file(&name, 0, &[0xDD; 70_000]).unwrap();
+        fs.sync().unwrap();
+        fs.remove_file(&name).unwrap();
+    }
+
+    let free_final = fs.free_block_count();
+    let leak = free_initial as i64 - free_final as i64;
+    assert!(
+        leak <= 2,
+        "50 create/delete cycles should not leak blocks, leaked={leak}"
+    );
+}
+
+#[test]
+fn test_gc_nested_dir_delete_reclaims() {
+    let (mut fs, _store, _crypto) = make_fs();
+    let free_initial = fs.free_block_count();
+
+    fs.create_directory("/a").unwrap();
+    fs.create_directory("/a/b").unwrap();
+    fs.create_file("/a/b/f.txt").unwrap();
+    fs.write_file("/a/b/f.txt", 0, &[0xEE; 10_000]).unwrap();
+    fs.sync().unwrap();
+
+    // Delete from the inside out.
+    fs.remove_file("/a/b/f.txt").unwrap();
+    fs.remove_file("/a/b").unwrap();
+    fs.remove_file("/a").unwrap();
+
+    let free_final = fs.free_block_count();
+    let gap = free_initial as i64 - free_final as i64;
+    assert!(
+        gap <= 2,
+        "deleting nested dirs should reclaim blocks, gap={gap}"
+    );
+}
+
+// ── Cross-directory rename tests ──
+
+#[test]
+fn test_cross_dir_rename_to_root() {
+    let (mut fs, _, _) = make_fs();
+    fs.create_directory("sub").unwrap();
+    fs.create_file("sub/deep.txt").unwrap();
+    fs.write_file("sub/deep.txt", 0, b"moved up").unwrap();
+    fs.sync().unwrap();
+
+    fs.rename("sub/deep.txt", "shallow.txt").unwrap();
+
+    assert!(fs.read_file("sub/deep.txt", 0, 1).is_err());
+    assert_eq!(fs.read_file("shallow.txt", 0, 20).unwrap(), b"moved up");
+}
+
+#[test]
+fn test_cross_dir_rename_from_root() {
+    let (mut fs, _, _) = make_fs();
+    fs.create_directory("sub").unwrap();
+    fs.create_file("top.txt").unwrap();
+    fs.write_file("top.txt", 0, b"moved down").unwrap();
+    fs.sync().unwrap();
+
+    fs.rename("top.txt", "sub/top.txt").unwrap();
+
+    assert!(fs.read_file("top.txt", 0, 1).is_err());
+    assert_eq!(fs.read_file("sub/top.txt", 0, 20).unwrap(), b"moved down");
+}
+
+#[test]
+fn test_cross_dir_rename_deep_to_deep() {
+    let (mut fs, _, _) = make_fs();
+    fs.create_directory("a").unwrap();
+    fs.create_directory("a/b").unwrap();
+    fs.create_directory("x").unwrap();
+    fs.create_directory("x/y").unwrap();
+    fs.create_file("a/b/data.bin").unwrap();
+    fs.write_file("a/b/data.bin", 0, &[0xAA; 1000]).unwrap();
+    fs.sync().unwrap();
+
+    fs.rename("a/b/data.bin", "x/y/data.bin").unwrap();
+
+    assert!(fs.read_file("a/b/data.bin", 0, 1).is_err());
+    let data = fs.read_file("x/y/data.bin", 0, 1000).unwrap();
+    assert!(data.iter().all(|&b| b == 0xAA));
+}
+
+#[test]
+fn test_cross_dir_rename_with_shared_ancestor() {
+    let (mut fs, _, _) = make_fs();
+    // Both paths share ancestor "root/shared".
+    fs.create_directory("shared").unwrap();
+    fs.create_directory("shared/src").unwrap();
+    fs.create_directory("shared/dst").unwrap();
+    fs.create_file("shared/src/item.txt").unwrap();
+    fs.write_file("shared/src/item.txt", 0, b"shared ancestor")
+        .unwrap();
+    fs.sync().unwrap();
+
+    fs.rename("shared/src/item.txt", "shared/dst/item.txt")
+        .unwrap();
+
+    assert!(fs.read_file("shared/src/item.txt", 0, 1).is_err());
+    assert_eq!(
+        fs.read_file("shared/dst/item.txt", 0, 30).unwrap(),
+        b"shared ancestor"
+    );
+}
+
+#[test]
+fn test_cross_dir_move_directory() {
+    let (mut fs, _, _) = make_fs();
+    fs.create_directory("a").unwrap();
+    fs.create_directory("b").unwrap();
+    fs.create_directory("a/subdir").unwrap();
+    fs.create_file("a/subdir/child.txt").unwrap();
+    fs.write_file("a/subdir/child.txt", 0, b"child data")
+        .unwrap();
+    fs.sync().unwrap();
+
+    // Move entire directory across parents.
+    fs.rename("a/subdir", "b/subdir").unwrap();
+
+    // Old path gone.
+    assert!(fs.list_directory("a/subdir").is_err());
+    // New path accessible.
+    let entries = fs.list_directory("b/subdir").unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].name, "child.txt");
+    assert_eq!(
+        fs.read_file("b/subdir/child.txt", 0, 20).unwrap(),
+        b"child data"
+    );
+}
+
+#[test]
+fn test_cross_dir_rename_with_new_name() {
+    let (mut fs, _, _) = make_fs();
+    fs.create_directory("src").unwrap();
+    fs.create_directory("dst").unwrap();
+    fs.create_file("src/old_name.txt").unwrap();
+    fs.write_file("src/old_name.txt", 0, b"renamed").unwrap();
+    fs.sync().unwrap();
+
+    // Move AND rename in one operation.
+    fs.rename("src/old_name.txt", "dst/new_name.txt").unwrap();
+
+    assert!(fs.read_file("src/old_name.txt", 0, 1).is_err());
+    assert_eq!(fs.read_file("dst/new_name.txt", 0, 20).unwrap(), b"renamed");
+}
+
+#[test]
+fn test_cross_dir_rename_dest_name_collision() {
+    let (mut fs, _, _) = make_fs();
+    fs.create_directory("a").unwrap();
+    fs.create_directory("b").unwrap();
+    fs.create_file("a/f.txt").unwrap();
+    fs.create_file("b/f.txt").unwrap();
+
+    // Destination name already exists — must fail.
+    assert!(fs.rename("a/f.txt", "b/f.txt").is_err());
+}
+
+#[test]
+fn test_cross_dir_rename_into_self_rejected() {
+    let (mut fs, _, _) = make_fs();
+    fs.create_directory("a").unwrap();
+    fs.create_directory("a/b").unwrap();
+
+    // Moving /a into /a/b/a would create a cycle.
+    assert!(fs.rename("a", "a/b/a").is_err());
+}
+
+#[test]
+fn test_cross_dir_rename_preserves_siblings() {
+    let (mut fs, _, _) = make_fs();
+    fs.create_directory("src").unwrap();
+    fs.create_directory("dst").unwrap();
+    fs.create_file("src/moving.txt").unwrap();
+    fs.create_file("src/staying.txt").unwrap();
+    fs.create_file("dst/existing.txt").unwrap();
+
+    fs.rename("src/moving.txt", "dst/moving.txt").unwrap();
+
+    // Source dir still has the other file.
+    let src_entries = fs.list_directory("src").unwrap();
+    assert_eq!(src_entries.len(), 1);
+    assert_eq!(src_entries[0].name, "staying.txt");
+
+    // Dest dir has both.
+    let dst_entries = fs.list_directory("dst").unwrap();
+    assert_eq!(dst_entries.len(), 2);
+    let names: Vec<&str> = dst_entries.iter().map(|e| e.name.as_str()).collect();
+    assert!(names.contains(&"existing.txt"));
+    assert!(names.contains(&"moving.txt"));
 }

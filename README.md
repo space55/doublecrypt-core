@@ -558,9 +558,7 @@ With `default-features = false`, only `prost` (for derive macros and encoding/de
 
 ## Limitations (v0.1)
 
-- **No garbage collection** — old blocks from previous copy-on-write generations are never reclaimed. Extended use will exhaust the block store.
 - **Single directory/extent page** — no overflow pages for directories or extent maps.
-- **Cross-directory rename not supported** — `rename` requires both paths to share the same parent directory.
 - **Unix-only disk I/O** — `DiskBlockStore` and `DeviceBlockStore` use `std::os::unix::fs::FileExt` (`pread`/`pwrite`). Works on Linux and macOS; Windows would need a different implementation.
 
 ## Block Device Usage (EBS / EC2)

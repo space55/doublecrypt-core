@@ -33,6 +33,9 @@ pub struct FilesystemCore {
     next_inode_id: InodeId,
     /// Write buffer: dirty file chunks held in memory until flush.
     write_buffer: HashMap<String, DirtyFile>,
+    /// Block ID of the most recently committed superblock object.
+    /// Freed when superseded by a new commit.
+    last_superblock_block: Option<u64>,
 }
 
 /// Tracks one ancestor directory during path resolution, used by
@@ -94,6 +97,7 @@ impl FilesystemCore {
             superblock: None,
             next_inode_id: 1,
             write_buffer: HashMap::new(),
+            last_superblock_block: None,
         }
     }
 
@@ -197,6 +201,7 @@ impl FilesystemCore {
 
         self.txn = TransactionManager::from_recovered(rp.generation, was_b);
         self.superblock = Some(sb.clone());
+        self.last_superblock_block = Some(rp.superblock_ref.block_id);
 
         // Rebuild allocator knowledge by walking the metadata tree.
         self.rebuild_allocator(&sb)?;
@@ -287,6 +292,20 @@ impl FilesystemCore {
         target_inode: &Inode,
         new_dir_page: &DirectoryPage,
     ) -> FsResult<()> {
+        // Collect old block IDs replaced by CoW.  Freed after commit succeeds.
+        let mut stale_blocks: Vec<u64> = Vec::new();
+
+        // Target directory: old dir page block.
+        stale_blocks.push(target_inode.directory_page_ref.block_id);
+        // Target inode block (its block ID is derived from the chain):
+        if ancestors.is_empty() {
+            // target IS the root inode.
+            stale_blocks.push(sb.root_inode_ref.block_id);
+        } else {
+            let last = ancestors.last().unwrap();
+            stale_blocks.push(last.dir_page.entries[last.child_index].inode_ref.block_id);
+        }
+
         // Write the modified directory page.
         let mut new_dp_block = self.allocator.allocate()?;
         self.write_obj(new_dp_block, ObjectKind::DirectoryPage, new_dir_page)?;
@@ -299,7 +318,23 @@ impl FilesystemCore {
         self.write_obj(new_inode_block, ObjectKind::Inode, &new_inode)?;
 
         // Propagate upward through ancestors (bottom to top).
-        for ancestor in ancestors.iter().rev() {
+        for (i, ancestor) in ancestors.iter().rev().enumerate() {
+            // Old ancestor dir page block.
+            stale_blocks.push(ancestor.inode.directory_page_ref.block_id);
+            // Old ancestor inode block.
+            let rev_idx = ancestors.len() - 1 - i;
+            if rev_idx == 0 {
+                // This is the root — its block is in the superblock.
+                stale_blocks.push(sb.root_inode_ref.block_id);
+            } else {
+                let parent = &ancestors[rev_idx - 1];
+                stale_blocks.push(
+                    parent.dir_page.entries[parent.child_index]
+                        .inode_ref
+                        .block_id,
+                );
+            }
+
             let mut parent_dp = ancestor.dir_page.clone();
             parent_dp.entries[ancestor.child_index].inode_ref = ObjectRef::new(new_inode_block);
 
@@ -319,7 +354,68 @@ impl FilesystemCore {
             root_inode_ref: ObjectRef::new(new_inode_block),
         };
         self.commit_superblock(new_sb)?;
+
+        // Free stale blocks after the commit has succeeded.
+        for block_id in stale_blocks {
+            let _ = self.allocator.free(block_id);
+        }
+
         Ok(())
+    }
+
+    /// CoW-propagate a modified directory page upward through a sub-chain of
+    /// ancestors, stopping before the common ancestor level.
+    ///
+    /// Returns the new top-level inode block ID.  The caller must update the
+    /// common ancestor's dir-page entry to point to this block.
+    ///
+    /// `stale_blocks` collects old blocks replaced by CoW.  The old inode
+    /// block of the topmost node (referenced by the common ancestor's
+    /// directory entry) is **not** added — the caller handles that.
+    fn cow_subchain(
+        &mut self,
+        sub_ancestors: &[AncestorEntry],
+        target_inode: &Inode,
+        new_dir_page: &DirectoryPage,
+        stale_blocks: &mut Vec<u64>,
+    ) -> FsResult<u64> {
+        // Write the modified directory page.
+        stale_blocks.push(target_inode.directory_page_ref.block_id);
+        let mut new_dp_block = self.allocator.allocate()?;
+        self.write_obj(new_dp_block, ObjectKind::DirectoryPage, new_dir_page)?;
+
+        // Write the updated target inode.
+        let mut new_inode = target_inode.clone();
+        new_inode.directory_page_ref = ObjectRef::new(new_dp_block);
+        new_inode.modified_at = now_secs();
+        let mut new_inode_block = self.allocator.allocate()?;
+        self.write_obj(new_inode_block, ObjectKind::Inode, &new_inode)?;
+
+        // Propagate upward through sub-ancestors (bottom to top).
+        for ancestor in sub_ancestors.iter().rev() {
+            // Old child inode block (the one we just replaced).
+            stale_blocks.push(
+                ancestor.dir_page.entries[ancestor.child_index]
+                    .inode_ref
+                    .block_id,
+            );
+            // Old ancestor dir page block.
+            stale_blocks.push(ancestor.inode.directory_page_ref.block_id);
+
+            let mut parent_dp = ancestor.dir_page.clone();
+            parent_dp.entries[ancestor.child_index].inode_ref = ObjectRef::new(new_inode_block);
+
+            new_dp_block = self.allocator.allocate()?;
+            self.write_obj(new_dp_block, ObjectKind::DirectoryPage, &parent_dp)?;
+
+            let mut parent_inode = ancestor.inode.clone();
+            parent_inode.directory_page_ref = ObjectRef::new(new_dp_block);
+            parent_inode.modified_at = now_secs();
+            new_inode_block = self.allocator.allocate()?;
+            self.write_obj(new_inode_block, ObjectKind::Inode, &parent_inode)?;
+        }
+
+        Ok(new_inode_block)
     }
 
     // ── Public operations ─────────────────────────────────────
@@ -646,33 +742,52 @@ impl FilesystemCore {
             .position(|e| e.name == leaf)
             .ok_or_else(|| FsError::FileNotFound(leaf.to_string()))?;
 
-        let entry = &dir_page.entries[idx];
-        if entry.kind == InodeKind::Directory {
-            let dir_inode: Inode = self.read_obj(entry.inode_ref.block_id)?;
-            let sub_page: DirectoryPage = self.read_obj(dir_inode.directory_page_ref.block_id)?;
-            if !sub_page.entries.is_empty() {
-                return Err(FsError::DirectoryNotEmpty(leaf.to_string()));
+        // Collect all blocks owned by the removed entry so we can free them.
+        let removed_entry = &dir_page.entries[idx];
+        let mut stale_blocks: Vec<u64> = Vec::new();
+        stale_blocks.push(removed_entry.inode_ref.block_id);
+        let removed_inode: Inode = self.read_obj(removed_entry.inode_ref.block_id)?;
+
+        match removed_entry.kind {
+            InodeKind::Directory => {
+                let sub_page: DirectoryPage =
+                    self.read_obj(removed_inode.directory_page_ref.block_id)?;
+                if !sub_page.entries.is_empty() {
+                    return Err(FsError::DirectoryNotEmpty(leaf.to_string()));
+                }
+                stale_blocks.push(removed_inode.directory_page_ref.block_id);
+            }
+            InodeKind::File => {
+                if !removed_inode.extent_map_ref.is_null() {
+                    stale_blocks.push(removed_inode.extent_map_ref.block_id);
+                    let extent_map: ExtentMap =
+                        self.read_obj(removed_inode.extent_map_ref.block_id)?;
+                    for ext in &extent_map.entries {
+                        stale_blocks.push(ext.data_ref.block_id);
+                    }
+                }
             }
         }
 
         dir_page.entries.remove(idx);
+        // commit_cow_chain frees its own stale CoW blocks.
         self.commit_cow_chain(&sb, &ancestors, &target_inode, &dir_page)?;
+
+        // Free blocks that belonged to the removed entry.
+        for block_id in stale_blocks {
+            let _ = self.allocator.free(block_id);
+        }
+
         Ok(())
     }
 
-    /// Rename a file or directory.  Both `old_path` and `new_path` must share
-    /// the same parent directory (move across directories is not supported yet).
+    /// Rename or move a file or directory.  Supports both same-directory
+    /// renames and cross-directory moves.
     pub fn rename(&mut self, old_path: &str, new_path: &str) -> FsResult<()> {
         let (old_dir, old_leaf) = Self::split_path(old_path)?;
         let (new_dir, new_leaf) = Self::split_path(new_path)?;
         self.validate_name(new_leaf)?;
         self.flush_all()?;
-
-        if old_dir != new_dir {
-            return Err(FsError::Internal(
-                "rename across directories is not supported".into(),
-            ));
-        }
 
         let sb = self
             .superblock
@@ -680,22 +795,151 @@ impl FilesystemCore {
             .ok_or(FsError::NotInitialized)?
             .clone();
         let root_inode: Inode = self.read_obj(sb.root_inode_ref.block_id)?;
-        let (ancestors, target_inode, mut dir_page) =
-            self.resolve_dir_chain(&old_dir, &root_inode)?;
 
-        if dir_page.entries.iter().any(|e| e.name == new_leaf) {
-            return Err(FsError::FileAlreadyExists(new_leaf.to_string()));
+        if old_dir == new_dir {
+            // ── Same-directory rename: just change the name in-place. ──
+            let (ancestors, target_inode, mut dir_page) =
+                self.resolve_dir_chain(&old_dir, &root_inode)?;
+
+            if dir_page.entries.iter().any(|e| e.name == new_leaf) {
+                return Err(FsError::FileAlreadyExists(new_leaf.to_string()));
+            }
+
+            let entry = dir_page
+                .entries
+                .iter_mut()
+                .find(|e| e.name == old_leaf)
+                .ok_or_else(|| FsError::FileNotFound(old_leaf.to_string()))?;
+
+            entry.name = new_leaf.to_string();
+            self.commit_cow_chain(&sb, &ancestors, &target_inode, &dir_page)?;
+        } else {
+            // ── Cross-directory rename / move. ──
+
+            // Prevent moving a directory into its own subtree.
+            let src_full: Vec<&str> = old_dir
+                .iter()
+                .copied()
+                .chain(std::iter::once(old_leaf))
+                .collect();
+            if new_dir.len() >= src_full.len() && new_dir[..src_full.len()] == src_full[..] {
+                return Err(FsError::Internal(
+                    "cannot move a directory into itself".into(),
+                ));
+            }
+
+            // Find the Least Common Ancestor (LCA) of the two parent dirs.
+            let common_len = old_dir
+                .iter()
+                .zip(new_dir.iter())
+                .take_while(|(a, b)| a == b)
+                .count();
+            let common_parts = &old_dir[..common_len];
+            let src_remaining = &old_dir[common_len..];
+            let dst_remaining = &new_dir[common_len..];
+
+            // Resolve the common ancestor chain from root.
+            let (common_ancestors, common_inode, common_dir_page) =
+                self.resolve_dir_chain(common_parts, &root_inode)?;
+
+            // Resolve source sub-chain below the common ancestor.
+            let (full_src_ancestors, src_inode, src_dir_page) = if src_remaining.is_empty() {
+                (Vec::new(), common_inode.clone(), common_dir_page.clone())
+            } else {
+                self.resolve_dir_chain(src_remaining, &common_inode)?
+            };
+
+            // Resolve destination sub-chain below the common ancestor.
+            let (full_dst_ancestors, dst_inode, dst_dir_page) = if dst_remaining.is_empty() {
+                (Vec::new(), common_inode.clone(), common_dir_page.clone())
+            } else {
+                self.resolve_dir_chain(dst_remaining, &common_inode)?
+            };
+
+            // Validate: source must exist, destination name must not.
+            if dst_dir_page.entries.iter().any(|e| e.name == new_leaf) {
+                return Err(FsError::FileAlreadyExists(new_leaf.to_string()));
+            }
+            let src_idx = src_dir_page
+                .entries
+                .iter()
+                .position(|e| e.name == old_leaf)
+                .ok_or_else(|| FsError::FileNotFound(old_leaf.to_string()))?;
+
+            // Build the moved entry with its new name.
+            let mut moved_entry = src_dir_page.entries[src_idx].clone();
+            moved_entry.name = new_leaf.to_string();
+
+            let mut stale_blocks: Vec<u64> = Vec::new();
+
+            // Start with the common ancestor's dir page; both sides
+            // accumulate updates into this copy.
+            let mut merged_common_dp = common_dir_page.clone();
+
+            // ── Source side ──
+            if src_remaining.is_empty() {
+                // Source dir IS the common ancestor — remove directly.
+                let idx = merged_common_dp
+                    .entries
+                    .iter()
+                    .position(|e| e.name == old_leaf)
+                    .ok_or_else(|| FsError::FileNotFound(old_leaf.to_string()))?;
+                merged_common_dp.entries.remove(idx);
+            } else {
+                // CoW the source sub-chain with the entry removed.
+                // full_src_ancestors[0] is the common ancestor itself;
+                // pass only the levels below it.
+                let src_sub = &full_src_ancestors[1..];
+                let mut new_src_dp = src_dir_page.clone();
+                new_src_dp.entries.remove(src_idx);
+
+                let new_src_child =
+                    self.cow_subchain(src_sub, &src_inode, &new_src_dp, &mut stale_blocks)?;
+
+                // Update the common ancestor's entry for the source branch.
+                let src_child_name = src_remaining[0];
+                let ci = merged_common_dp
+                    .entries
+                    .iter()
+                    .position(|e| e.name == src_child_name)
+                    .ok_or_else(|| FsError::DirectoryNotFound(src_child_name.to_string()))?;
+                stale_blocks.push(merged_common_dp.entries[ci].inode_ref.block_id);
+                merged_common_dp.entries[ci].inode_ref = ObjectRef::new(new_src_child);
+            }
+
+            // ── Destination side ──
+            if dst_remaining.is_empty() {
+                // Destination dir IS the common ancestor — add directly.
+                merged_common_dp.entries.push(moved_entry);
+            } else {
+                // CoW the destination sub-chain with the entry added.
+                let dst_sub = &full_dst_ancestors[1..];
+                let mut new_dst_dp = dst_dir_page.clone();
+                new_dst_dp.entries.push(moved_entry);
+
+                let new_dst_child =
+                    self.cow_subchain(dst_sub, &dst_inode, &new_dst_dp, &mut stale_blocks)?;
+
+                // Update the common ancestor's entry for the dest branch.
+                let dst_child_name = dst_remaining[0];
+                let ci = merged_common_dp
+                    .entries
+                    .iter()
+                    .position(|e| e.name == dst_child_name)
+                    .ok_or_else(|| FsError::DirectoryNotFound(dst_child_name.to_string()))?;
+                stale_blocks.push(merged_common_dp.entries[ci].inode_ref.block_id);
+                merged_common_dp.entries[ci].inode_ref = ObjectRef::new(new_dst_child);
+            }
+
+            // CoW from the common ancestor up to root and commit.
+            self.commit_cow_chain(&sb, &common_ancestors, &common_inode, &merged_common_dp)?;
+
+            // Free sub-chain stale blocks (commit_cow_chain frees its own).
+            for block_id in stale_blocks {
+                let _ = self.allocator.free(block_id);
+            }
         }
 
-        let entry = dir_page
-            .entries
-            .iter_mut()
-            .find(|e| e.name == old_leaf)
-            .ok_or_else(|| FsError::FileNotFound(old_leaf.to_string()))?;
-
-        entry.name = new_leaf.to_string();
-
-        self.commit_cow_chain(&sb, &ancestors, &target_inode, &dir_page)?;
         Ok(())
     }
 
@@ -704,6 +948,12 @@ impl FilesystemCore {
     pub fn sync(&mut self) -> FsResult<()> {
         self.flush_all()?;
         self.store.sync()
+    }
+
+    /// Returns the number of free blocks in the allocator.
+    #[cfg(test)]
+    pub fn free_block_count(&self) -> u64 {
+        self.allocator.free_count()
     }
 
     // ── Internal helpers ──
@@ -732,8 +982,20 @@ impl FilesystemCore {
 
         let mut extent_map = dirty.extent_map;
 
+        // Collect stale data chunk blocks being overwritten.
+        let mut stale_blocks: Vec<u64> = Vec::new();
+
         // Write each dirty chunk to a new block.
         for (&chunk_idx, chunk_data) in &dirty.dirty_chunks {
+            // If this chunk already existed, the old data block is stale.
+            if let Some(existing) = extent_map
+                .entries
+                .iter()
+                .find(|e| e.chunk_index == chunk_idx)
+            {
+                stale_blocks.push(existing.data_ref.block_id);
+            }
+
             let data_block = self.allocator.allocate()?;
             write_encrypted_raw(
                 self.store.as_ref(),
@@ -762,9 +1024,24 @@ impl FilesystemCore {
 
         extent_map.entries.sort_by_key(|e| e.chunk_index);
 
+        // Old extent map block is stale.
+        if !dirty.base_inode.extent_map_ref.is_null() {
+            stale_blocks.push(dirty.base_inode.extent_map_ref.block_id);
+        }
+
         // Write extent map.
         let new_em_block = self.allocator.allocate()?;
         self.write_obj(new_em_block, ObjectKind::ExtentMap, &extent_map)?;
+
+        // Old file inode block is stale — find it from the dir entry.
+        let old_inode_block = dir_page
+            .entries
+            .iter()
+            .find(|e| e.name == leaf)
+            .map(|e| e.inode_ref.block_id);
+        if let Some(blk) = old_inode_block {
+            stale_blocks.push(blk);
+        }
 
         // Write inode.
         let mut new_inode = dirty.base_inode;
@@ -782,7 +1059,14 @@ impl FilesystemCore {
             }
         }
 
+        // commit_cow_chain frees its own stale blocks (dir pages, ancestor inodes).
         self.commit_cow_chain(&sb, &ancestors, &target_inode, &new_dir_page)?;
+
+        // Free file-level stale blocks (data chunks, old extent map, old inode).
+        for block_id in stale_blocks {
+            let _ = self.allocator.free(block_id);
+        }
+
         Ok(())
     }
 
@@ -935,13 +1219,18 @@ impl FilesystemCore {
     }
 
     fn commit_superblock(&mut self, sb: Superblock) -> FsResult<()> {
-        self.txn.commit(
+        let new_sb_block = self.txn.commit(
             self.store.as_ref(),
             self.crypto.as_ref(),
             &self.codec,
             &self.allocator,
             &sb,
         )?;
+        // Free the previous superblock block now that the new one is committed.
+        if let Some(old) = self.last_superblock_block {
+            let _ = self.allocator.free(old);
+        }
+        self.last_superblock_block = Some(new_sb_block);
         self.superblock = Some(sb);
         Ok(())
     }
