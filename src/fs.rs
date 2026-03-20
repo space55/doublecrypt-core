@@ -956,6 +956,41 @@ impl FilesystemCore {
         self.allocator.free_count()
     }
 
+    /// Fill every unallocated block with cryptographically random data.
+    ///
+    /// This makes free space indistinguishable from encrypted ciphertext,
+    /// preventing an observer from determining which blocks contain real
+    /// data.  Call after `init_filesystem()` or `open()` when provisioning
+    /// a new store, or periodically as a scrub operation.
+    ///
+    /// Uses batch writes when the block store supports them.
+    pub fn scrub_free_blocks(&mut self) -> FsResult<()> {
+        self.flush_all()?;
+
+        let free_ids = self.allocator.free_block_ids();
+        if free_ids.is_empty() {
+            return Ok(());
+        }
+
+        let bs = self.store.block_size();
+        let mut rng = rand::thread_rng();
+
+        // Write in batches to amortise call overhead and enable pipelined I/O.
+        const BATCH: usize = 64;
+        for chunk in free_ids.chunks(BATCH) {
+            let mut pairs: Vec<(u64, Vec<u8>)> = Vec::with_capacity(chunk.len());
+            for &id in chunk {
+                let mut buf = vec![0u8; bs];
+                rng.fill_bytes(&mut buf);
+                pairs.push((id, buf));
+            }
+            let refs: Vec<(u64, &[u8])> = pairs.iter().map(|(id, d)| (*id, d.as_slice())).collect();
+            self.store.write_blocks(&refs)?;
+        }
+
+        self.store.sync()
+    }
+
     // ── Internal helpers ──
 
     /// Flush a single file's buffered writes to the block store.

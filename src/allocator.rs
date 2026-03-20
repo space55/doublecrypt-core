@@ -58,6 +58,12 @@ impl BitmapAllocator {
         let state = self.state.lock().unwrap();
         state.free_set.len() as u64
     }
+
+    /// Return all free block IDs.
+    pub fn free_block_ids(&self) -> Vec<u64> {
+        let state = self.state.lock().unwrap();
+        state.free_set.iter().copied().collect()
+    }
 }
 
 impl SlotAllocator for BitmapAllocator {

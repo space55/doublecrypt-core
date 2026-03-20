@@ -519,6 +519,21 @@ pub unsafe extern "C" fn fs_sync(handle: *mut FsHandle) -> i32 {
     }
 }
 
+/// Fill all unused blocks with cryptographically random data.
+///
+/// # Safety
+/// `handle` must be a valid pointer.
+#[no_mangle]
+pub unsafe extern "C" fn fs_scrub_free_blocks(handle: *mut FsHandle) -> i32 {
+    let Some(h) = (unsafe { handle.as_mut() }) else {
+        return FsErrorCode::InvalidArgument as i32;
+    };
+    match h.core.scrub_free_blocks() {
+        Ok(()) => FsErrorCode::Ok as i32,
+        Err(ref e) => FsErrorCode::from(e) as i32,
+    }
+}
+
 /// Free a string previously returned by `fs_list_root`.
 ///
 /// # Safety

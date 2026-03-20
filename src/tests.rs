@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use crate::block_store::MemoryBlockStore;
+use crate::block_store::{BlockStore, MemoryBlockStore};
 use crate::crypto::{ChaChaEngine, CryptoEngine};
 use crate::fs::FilesystemCore;
 use crate::model::{InodeKind, DEFAULT_BLOCK_SIZE};
@@ -889,4 +889,75 @@ fn test_cross_dir_rename_preserves_siblings() {
     let names: Vec<&str> = dst_entries.iter().map(|e| e.name.as_str()).collect();
     assert!(names.contains(&"existing.txt"));
     assert!(names.contains(&"moving.txt"));
+}
+
+// ── Scrub free blocks tests ──
+
+#[test]
+fn test_scrub_free_blocks_writes_all_free() {
+    let (mut fs, store, _) = make_fs();
+
+    // After init there should be many free blocks.
+    let free_before = fs.free_block_count();
+    assert!(free_before > 10, "should have many free blocks");
+
+    // Free blocks should initially be zeroes (MemoryBlockStore default).
+    let first_free_id = {
+        // Block 3 is the first allocatable block (FIRST_DATA_BLOCK).
+        // Some will be allocated by init_filesystem. Find one that's free.
+        let mut id = None;
+        for candidate in 3..store.total_blocks() {
+            if store.read_block(candidate).unwrap().iter().all(|&b| b == 0) {
+                id = Some(candidate);
+                break;
+            }
+        }
+        id.expect("should find a zero block")
+    };
+
+    fs.scrub_free_blocks().unwrap();
+
+    // Free block should now contain random (non-zero) data.
+    let data = store.read_block(first_free_id).unwrap();
+    let nonzero = data.iter().filter(|&&b| b != 0).count();
+    // With 65536 random bytes, essentially all will be nonzero.
+    assert!(
+        nonzero > 100,
+        "scrubbed block should be non-zero random data, got {nonzero} nonzero bytes"
+    );
+
+    // Free count should be unchanged — no blocks were allocated.
+    assert_eq!(fs.free_block_count(), free_before);
+}
+
+#[test]
+fn test_scrub_preserves_file_data() {
+    let (mut fs, _, _) = make_fs();
+    fs.create_file("keep.txt").unwrap();
+    fs.write_file("keep.txt", 0, b"important data").unwrap();
+    fs.sync().unwrap();
+
+    fs.scrub_free_blocks().unwrap();
+
+    // File data must be intact.
+    let data = fs.read_file("keep.txt", 0, 100).unwrap();
+    assert_eq!(data, b"important data");
+}
+
+#[test]
+fn test_scrub_on_full_store_is_noop() {
+    // Small store: 8 blocks total — just enough for init_filesystem.
+    let store = Arc::new(MemoryBlockStore::new(DEFAULT_BLOCK_SIZE, 8));
+    let crypto = Arc::new(ChaChaEngine::generate().unwrap());
+    let mut fs = FilesystemCore::new(store.clone(), crypto.clone());
+    fs.init_filesystem().unwrap();
+
+    // Fill remaining free blocks.
+    while fs
+        .create_file(&format!("f{}", rand::random::<u32>()))
+        .is_ok()
+    {}
+
+    // Scrub should succeed even with zero free blocks.
+    fs.scrub_free_blocks().unwrap();
 }
