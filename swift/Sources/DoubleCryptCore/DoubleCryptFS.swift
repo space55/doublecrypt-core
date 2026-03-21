@@ -36,11 +36,17 @@ public enum DoubleCryptError: Int32, Error, CustomStringConvertible {
     }
 }
 
-/// A directory entry returned by ``DoubleCryptFS/listDirectory()``.
+/// A directory entry returned by ``DoubleCryptFS/listDirectory(path:)``.
 public struct DirEntry: Codable {
     public let name: String
     public let kind: String
     public let size: UInt64
+    public let inode_id: UInt64
+
+    /// Whether this entry is a file.
+    public var isFile: Bool { kind == "File" }
+    /// Whether this entry is a directory.
+    public var isDirectory: Bool { kind == "Directory" }
 }
 
 /// Swift wrapper around the doublecrypt-core C ABI.
@@ -185,7 +191,14 @@ public final class DoubleCryptFS {
         try check(fs_open(handle))
     }
 
-    /// Flush all pending writes.
+    /// Flush buffered writes to the block store without calling fsync.
+    ///
+    /// Prefer this over ``sync()`` unless you need durability guarantees (e.g. explicit fsync).
+    public func flush() throws {
+        try check(fs_flush(handle))
+    }
+
+    /// Flush all pending writes and call fsync.
     public func sync() throws {
         try check(fs_sync(handle))
     }
@@ -240,9 +253,16 @@ public final class DoubleCryptFS {
         try check(name.withCString { fs_create_dir(handle, $0) })
     }
 
-    public func listDirectory() throws -> [DirEntry] {
+    /// List the contents of a directory.
+    ///
+    /// - Parameter path: The directory path. Pass `""` or `"/"` for the root directory.
+    ///   Supports nested paths like `"photos/vacation"`.
+    public func listDirectory(path: String = "") throws -> [DirEntry] {
         var errCode: Int32 = 0
-        guard let cStr = fs_list_root(handle, &errCode) else {
+        let cStr: UnsafeMutablePointer<CChar>? = path.withCString { cPath in
+            fs_list_dir(handle, cPath, &errCode)
+        }
+        guard let cStr else {
             throw DoubleCryptError(rawValue: errCode) ?? .internalError
         }
         defer { fs_free_string(cStr) }
@@ -251,6 +271,30 @@ public final class DoubleCryptFS {
             throw DoubleCryptError.internalError
         }
         return try JSONDecoder().decode([DirEntry].self, from: data)
+    }
+
+    /// Get metadata for a single file or directory.
+    ///
+    /// This is much cheaper than ``listDirectory(path:)`` when you only need info about one entry.
+    ///
+    /// - Parameter path: Path to the file or directory (e.g. `"photos/img.jpg"`).
+    /// - Returns: A tuple of `(size, isDirectory, inodeId)`.
+    public func stat(_ path: String) throws -> (size: UInt64, isDirectory: Bool, inodeId: UInt64) {
+        var outSize: UInt64 = 0
+        var outKind: Int32 = 0
+        var outInodeId: UInt64 = 0
+        try check(path.withCString { cPath in
+            fs_stat(handle, cPath, &outSize, &outKind, &outInodeId)
+        })
+        return (size: outSize, isDirectory: outKind == 1, inodeId: outInodeId)
+    }
+
+    /// Fill all unused blocks with cryptographically random data.
+    ///
+    /// This ensures that free space is indistinguishable from ciphertext,
+    /// preventing an attacker from determining how much data is stored.
+    public func scrubFreeBlocks() throws {
+        try check(fs_scrub_free_blocks(handle))
     }
 
     // MARK: - Private

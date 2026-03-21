@@ -65,7 +65,7 @@ try fs.initFilesystem()
 ### File Operations
 
 ```swift
-// Create a file (flat namespace, no nested directories yet)
+// Create a file (supports nested paths like "docs/notes.txt")
 try fs.createFile("notes.txt")
 
 // Write data (offset defaults to 0)
@@ -91,25 +91,47 @@ try fs.removeFile("readme.txt")
 // Create a directory
 try fs.createDirectory("photos")
 
+// Create nested directories (parents must exist)
+try fs.createDirectory("photos/vacation")
+
 // List root directory — returns [DirEntry]
 let entries = try fs.listDirectory()
 for entry in entries {
     print("\(entry.name)  \(entry.kind)  \(entry.size) bytes")
-    // entry.kind is "file" or "directory"
+    // entry.kind is "File" or "Directory"
+    // entry.isFile / entry.isDirectory convenience booleans
 }
 
+// List a subdirectory
+let photos = try fs.listDirectory(path: "photos")
+
+// Stat a single file (cheaper than listing the parent directory)
+let (size, isDir, inodeId) = try fs.stat("notes.txt")
+
 // Remove an empty directory
+try fs.removeFile("photos/vacation")
 try fs.removeFile("photos")
 ```
 
 ### Persistence
 
 ```swift
-// Flush all writes to the backing file. Always call before closing.
+// Flush buffered writes (no fsync). Preferred for normal use.
+try fs.flush()
+
+// Flush + fsync. Use for explicit durability guarantees.
 try fs.sync()
 ```
 
-The `DoubleCryptFS` instance is freed automatically when it goes out of scope (`deinit` calls the Rust destructor). Always call `sync()` before the handle is dropped if you need durability.
+The `DoubleCryptFS` instance is freed automatically when it goes out of scope (`deinit` calls the Rust destructor). Always call `flush()` or `sync()` before the handle is dropped if you need durability.
+
+### Security
+
+```swift
+// Fill all free blocks with random data so free space is indistinguishable
+// from ciphertext. Run periodically or after bulk deletes.
+try fs.scrubFreeBlocks()
+```
 
 ### Error Handling
 
@@ -148,9 +170,13 @@ Error cases:
 
 ```swift
 public struct DirEntry: Codable {
-    public let name: String   // filename
-    public let kind: String   // "file" or "directory"
-    public let size: UInt64   // size in bytes (0 for directories)
+    public let name: String     // filename
+    public let kind: String     // "File" or "Directory"
+    public let size: UInt64     // size in bytes (0 for directories)
+    public let inode_id: UInt64 // logical inode id
+
+    public var isFile: Bool
+    public var isDirectory: Bool
 }
 ```
 
@@ -172,7 +198,7 @@ createOnDisk / open
 
 ## Constraints
 
-- **Flat directory model**: all files and directories live in the root. No nested paths.
+- **Nested directories**: supported. Create parents before children.
 - **Filename limit**: 255 bytes UTF-8.
 - **Block size**: fixed at creation time (default 64 KiB). Cannot be changed after.
 - **Concurrency**: the `DoubleCryptFS` handle is **not** thread-safe. Serialize access or use one handle per thread/actor.
