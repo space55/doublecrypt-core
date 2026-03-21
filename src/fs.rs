@@ -10,8 +10,8 @@ use rand::RngCore;
 use crate::allocator::{BitmapAllocator, SlotAllocator};
 use crate::block_store::BlockStore;
 use crate::codec::{
-    decrypt_block_to_plaintext, prepare_encrypted_block, read_encrypted_object, read_encrypted_raw,
-    write_encrypted_object, ObjectCodec, PostcardCodec,
+    decrypt_block_to_plaintext, prepare_encrypted_block, prepare_encrypted_object,
+    read_encrypted_object, read_encrypted_raw, write_encrypted_object, ObjectCodec, PostcardCodec,
 };
 use crate::crypto::CryptoEngine;
 use crate::error::{FsError, FsResult};
@@ -675,6 +675,56 @@ impl FilesystemCore {
         Ok(result)
     }
 
+    /// Get metadata for a single file or directory without listing the
+    /// entire parent directory.  Much cheaper than [`list_directory()`] for
+    /// FUSE `getattr` / `lookup` operations.
+    pub fn stat(&self, path: &str) -> FsResult<DirListEntry> {
+        let path_key = path.trim_matches('/');
+
+        // Root directory.
+        if path_key.is_empty() {
+            let sb = self.superblock.as_ref().ok_or(FsError::NotInitialized)?;
+            let root_inode: Inode = self.read_obj(sb.root_inode_ref.block_id)?;
+            return Ok(DirListEntry {
+                name: String::new(),
+                kind: InodeKind::Directory,
+                size: root_inode.size,
+                inode_id: root_inode.id,
+            });
+        }
+
+        let (dir_parts, leaf) = Self::split_path(path)?;
+        let sb = self.superblock.as_ref().ok_or(FsError::NotInitialized)?;
+        let root_inode: Inode = self.read_obj(sb.root_inode_ref.block_id)?;
+        let (_, _, dir_page) = self.resolve_dir_chain(&dir_parts, &root_inode)?;
+
+        let entry = dir_page
+            .entries
+            .iter()
+            .find(|e| e.name == leaf)
+            .ok_or_else(|| FsError::FileNotFound(leaf.to_string()))?;
+
+        let inode: Inode = self.read_obj(entry.inode_ref.block_id)?;
+
+        // Use buffered size if this file has pending writes.
+        let size = if entry.kind == InodeKind::File {
+            if let Some(dirty) = self.write_buffer.get(path_key) {
+                dirty.size
+            } else {
+                inode.size
+            }
+        } else {
+            inode.size
+        };
+
+        Ok(DirListEntry {
+            name: entry.name.clone(),
+            kind: entry.kind,
+            size,
+            inode_id: entry.inode_id,
+        })
+    }
+
     /// Create a subdirectory at the given path.
     ///
     /// Parent directories must already exist; only the leaf is created.
@@ -947,6 +997,16 @@ impl FilesystemCore {
         Ok(())
     }
 
+    /// Flush all buffered writes to the block store **without** calling
+    /// `store.sync()` (fsync).
+    ///
+    /// Use this for FUSE `write`/`release` handlers where you want data
+    /// committed to the block store but don't need a durable fsync.
+    /// Call [`sync()`](Self::sync) for an explicit fsync.
+    pub fn flush(&mut self) -> FsResult<()> {
+        self.flush_all()
+    }
+
     /// Sync / flush. Writes all buffered data to blocks and calls through
     /// to the block store sync.
     pub fn sync(&mut self) -> FsResult<()> {
@@ -1065,7 +1125,51 @@ impl FilesystemCore {
             }
         }
 
-        // Single batched write for all dirty chunks.
+        // Single batched write for all dirty chunks + extent map + inode.
+        extent_map.entries.sort_by_key(|e| e.chunk_index);
+
+        // Old extent map block is stale.
+        if !dirty.base_inode.extent_map_ref.is_null() {
+            stale_blocks.push(dirty.base_inode.extent_map_ref.block_id);
+        }
+
+        // Prepare extent map block.
+        let new_em_block = self.allocator.allocate()?;
+        let em_encrypted = prepare_encrypted_object(
+            block_size,
+            self.crypto.as_ref(),
+            &self.codec,
+            ObjectKind::ExtentMap,
+            &extent_map,
+        )?;
+        batch.push((new_em_block, em_encrypted));
+
+        // Old file inode block is stale — find it from the dir entry.
+        let old_inode_block = dir_page
+            .entries
+            .iter()
+            .find(|e| e.name == leaf)
+            .map(|e| e.inode_ref.block_id);
+        if let Some(blk) = old_inode_block {
+            stale_blocks.push(blk);
+        }
+
+        // Prepare inode block.
+        let mut new_inode = dirty.base_inode;
+        new_inode.size = dirty.size;
+        new_inode.extent_map_ref = ObjectRef::new(new_em_block);
+        new_inode.modified_at = now_secs();
+        let new_inode_block = self.allocator.allocate()?;
+        let inode_encrypted = prepare_encrypted_object(
+            block_size,
+            self.crypto.as_ref(),
+            &self.codec,
+            ObjectKind::Inode,
+            &new_inode,
+        )?;
+        batch.push((new_inode_block, inode_encrypted));
+
+        // Write ALL blocks in one call (data chunks + extent map + inode).
         {
             let mut cache = self.obj_cache.borrow_mut();
             for &(id, _) in &batch {
@@ -1078,35 +1182,6 @@ impl FilesystemCore {
                 .collect();
             self.store.write_blocks(&refs)?;
         }
-
-        extent_map.entries.sort_by_key(|e| e.chunk_index);
-
-        // Old extent map block is stale.
-        if !dirty.base_inode.extent_map_ref.is_null() {
-            stale_blocks.push(dirty.base_inode.extent_map_ref.block_id);
-        }
-
-        // Write extent map.
-        let new_em_block = self.allocator.allocate()?;
-        self.write_obj(new_em_block, ObjectKind::ExtentMap, &extent_map)?;
-
-        // Old file inode block is stale — find it from the dir entry.
-        let old_inode_block = dir_page
-            .entries
-            .iter()
-            .find(|e| e.name == leaf)
-            .map(|e| e.inode_ref.block_id);
-        if let Some(blk) = old_inode_block {
-            stale_blocks.push(blk);
-        }
-
-        // Write inode.
-        let mut new_inode = dirty.base_inode;
-        new_inode.size = dirty.size;
-        new_inode.extent_map_ref = ObjectRef::new(new_em_block);
-        new_inode.modified_at = now_secs();
-        let new_inode_block = self.allocator.allocate()?;
-        self.write_obj(new_inode_block, ObjectKind::Inode, &new_inode)?;
 
         // Update dir entry.
         let mut new_dir_page = dir_page.clone();

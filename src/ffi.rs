@@ -504,7 +504,25 @@ pub unsafe extern "C" fn fs_rename(
     }
 }
 
-/// Sync / flush the filesystem.
+/// Flush buffered writes to the block store **without** calling fsync.
+///
+/// Use this for FUSE `write`/`release` handlers.  Call [`fs_sync`] only
+/// for explicit fsync requests.
+///
+/// # Safety
+/// `handle` must be a valid pointer.
+#[no_mangle]
+pub unsafe extern "C" fn fs_flush(handle: *mut FsHandle) -> i32 {
+    let Some(h) = (unsafe { handle.as_mut() }) else {
+        return FsErrorCode::InvalidArgument as i32;
+    };
+    match h.core.flush() {
+        Ok(()) => FsErrorCode::Ok as i32,
+        Err(ref e) => FsErrorCode::from(e) as i32,
+    }
+}
+
+/// Sync / flush the filesystem (flush + fsync).
 ///
 /// # Safety
 /// `handle` must be a valid pointer.
@@ -515,6 +533,48 @@ pub unsafe extern "C" fn fs_sync(handle: *mut FsHandle) -> i32 {
     };
     match h.core.sync() {
         Ok(()) => FsErrorCode::Ok as i32,
+        Err(ref e) => FsErrorCode::from(e) as i32,
+    }
+}
+
+/// Stat metadata for a single file/directory.
+///
+/// Returns `0` on success and populates the out-parameters.  Much cheaper
+/// than `fs_list_dir` for FUSE `getattr` / `lookup`.
+///
+/// `out_size`:  file size in bytes (or 0 for directories).
+/// `out_kind`:  0 = file, 1 = directory.
+/// `out_inode_id`: the logical inode id.
+///
+/// # Safety
+/// `handle`, `name`, and all `out_*` pointers must be valid.
+#[no_mangle]
+pub unsafe extern "C" fn fs_stat(
+    handle: *mut FsHandle,
+    name: *const c_char,
+    out_size: *mut u64,
+    out_kind: *mut i32,
+    out_inode_id: *mut u64,
+) -> i32 {
+    let (h, name_str) = match validate_handle_and_name(handle, name) {
+        Ok(v) => v,
+        Err(code) => return code,
+    };
+    if out_size.is_null() || out_kind.is_null() || out_inode_id.is_null() {
+        return FsErrorCode::InvalidArgument as i32;
+    }
+    match h.core.stat(name_str) {
+        Ok(entry) => {
+            unsafe {
+                *out_size = entry.size;
+                *out_kind = match entry.kind {
+                    crate::model::InodeKind::File => 0,
+                    crate::model::InodeKind::Directory => 1,
+                };
+                *out_inode_id = entry.inode_id;
+            }
+            FsErrorCode::Ok as i32
+        }
         Err(ref e) => FsErrorCode::from(e) as i32,
     }
 }

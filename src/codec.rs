@@ -40,23 +40,21 @@ pub fn write_encrypted_object<T: serde::Serialize>(
     kind: ObjectKind,
     obj: &T,
 ) -> FsResult<()> {
-    let plaintext = codec.serialize_object(obj)?;
-    let encrypted = encrypt_object(crypto, kind, &plaintext)?;
-    let envelope_bytes = codec.serialize_object(&encrypted)?;
-
-    let block_size = store.block_size();
-    if envelope_bytes.len() > block_size {
-        return Err(FsError::DataTooLarge(envelope_bytes.len()));
-    }
-
-    // Pad to block size with random bytes so padding is indistinguishable from ciphertext.
-    let mut block = random_block(block_size);
-    // First 4 bytes: little-endian length of the envelope.
-    let len = envelope_bytes.len() as u32;
-    block[..4].copy_from_slice(&len.to_le_bytes());
-    block[4..4 + envelope_bytes.len()].copy_from_slice(&envelope_bytes);
-
+    let block = prepare_encrypted_object(store.block_size(), crypto, codec, kind, obj)?;
     store.write_block(block_id, &block)
+}
+
+/// Serialize, encrypt, and pad a typed object into a block-sized buffer
+/// (without writing to store).  Returns the ready-to-write block bytes.
+pub fn prepare_encrypted_object<T: serde::Serialize>(
+    block_size: usize,
+    crypto: &dyn CryptoEngine,
+    codec: &PostcardCodec,
+    kind: ObjectKind,
+    obj: &T,
+) -> FsResult<Vec<u8>> {
+    let plaintext = codec.serialize_object(obj)?;
+    prepare_encrypted_block(block_size, crypto, codec, kind, &plaintext)
 }
 
 /// High-level helper: read a block, extract envelope, decrypt, deserialize.
