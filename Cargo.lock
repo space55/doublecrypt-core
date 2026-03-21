@@ -185,7 +185,7 @@ dependencies = [
 
 [[package]]
 name = "doublecrypt-core"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "blake3",
  "chacha20poly1305",

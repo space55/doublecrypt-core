@@ -540,7 +540,7 @@ impl FilesystemCore {
         } else {
             write_start / chunk_size
         };
-        let last_chunk = (new_size - 1) / chunk_size;
+        let last_chunk = (write_end - 1) / chunk_size;
 
         for chunk_idx in first_chunk..=last_chunk {
             let chunk_file_start = chunk_idx * chunk_size;
