@@ -66,6 +66,18 @@ pub fn read_encrypted_object<T: serde::de::DeserializeOwned>(
     codec: &PostcardCodec,
     block_id: u64,
 ) -> FsResult<T> {
+    let plaintext = decrypt_block_to_plaintext(store, crypto, codec, block_id)?;
+    codec.deserialize_object(&plaintext)
+}
+
+/// Read a block, extract envelope, decrypt, and return the raw plaintext bytes
+/// (before deserialization into a typed object).  Used by the object cache.
+pub fn decrypt_block_to_plaintext(
+    store: &dyn BlockStore,
+    crypto: &dyn CryptoEngine,
+    codec: &PostcardCodec,
+    block_id: u64,
+) -> FsResult<Vec<u8>> {
     let block = store.read_block(block_id)?;
 
     if block.len() < 4 {
@@ -79,8 +91,7 @@ pub fn read_encrypted_object<T: serde::de::DeserializeOwned>(
 
     let envelope_bytes = &block[4..4 + len];
     let encrypted: EncryptedObject = codec.deserialize_object(envelope_bytes)?;
-    let plaintext = decrypt_object(crypto, &encrypted)?;
-    codec.deserialize_object(&plaintext)
+    decrypt_object(crypto, &encrypted)
 }
 
 /// Write raw encrypted bytes (for file data chunks that are already raw bytes).
@@ -92,10 +103,22 @@ pub fn write_encrypted_raw(
     kind: ObjectKind,
     raw_data: &[u8],
 ) -> FsResult<()> {
+    let block = prepare_encrypted_block(store.block_size(), crypto, codec, kind, raw_data)?;
+    store.write_block(block_id, &block)
+}
+
+/// Encrypt raw data and pack it into a block-sized buffer (without writing to store).
+/// Returns the ready-to-write block bytes.
+pub fn prepare_encrypted_block(
+    block_size: usize,
+    crypto: &dyn CryptoEngine,
+    codec: &PostcardCodec,
+    kind: ObjectKind,
+    raw_data: &[u8],
+) -> FsResult<Vec<u8>> {
     let encrypted = encrypt_object(crypto, kind, raw_data)?;
     let envelope_bytes = codec.serialize_object(&encrypted)?;
 
-    let block_size = store.block_size();
     if envelope_bytes.len() > block_size {
         return Err(FsError::DataTooLarge(envelope_bytes.len()));
     }
@@ -105,7 +128,7 @@ pub fn write_encrypted_raw(
     block[..4].copy_from_slice(&len.to_le_bytes());
     block[4..4 + envelope_bytes.len()].copy_from_slice(&envelope_bytes);
 
-    store.write_block(block_id, &block)
+    Ok(block)
 }
 
 /// Read and decrypt raw bytes (for file data chunks).

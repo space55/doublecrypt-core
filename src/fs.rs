@@ -1,14 +1,17 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use lru::LruCache;
 use rand::RngCore;
 
 use crate::allocator::{BitmapAllocator, SlotAllocator};
 use crate::block_store::BlockStore;
 use crate::codec::{
-    read_encrypted_object, read_encrypted_raw, write_encrypted_object, write_encrypted_raw,
-    ObjectCodec, PostcardCodec,
+    decrypt_block_to_plaintext, prepare_encrypted_block, read_encrypted_object, read_encrypted_raw,
+    write_encrypted_object, ObjectCodec, PostcardCodec,
 };
 use crate::crypto::CryptoEngine;
 use crate::error::{FsError, FsResult};
@@ -36,6 +39,9 @@ pub struct FilesystemCore {
     /// Block ID of the most recently committed superblock object.
     /// Freed when superseded by a new commit.
     last_superblock_block: Option<u64>,
+    /// LRU cache of decrypted metadata objects (inodes, dir pages, extent maps)
+    /// keyed by block ID.  Avoids repeated decrypt + deserialize on every op.
+    obj_cache: RefCell<LruCache<u64, Vec<u8>>>,
 }
 
 /// Tracks one ancestor directory during path resolution, used by
@@ -98,6 +104,7 @@ impl FilesystemCore {
             next_inode_id: 1,
             write_buffer: HashMap::new(),
             last_superblock_block: None,
+            obj_cache: RefCell::new(LruCache::new(NonZeroUsize::new(256).unwrap())),
         }
     }
 
@@ -616,16 +623,13 @@ impl FilesystemCore {
         }
 
         let file_inode: Inode = self.read_obj(entry.inode_ref.block_id)?;
-        let extent_map: ExtentMap = self.read_obj(file_inode.extent_map_ref.block_id)?;
 
-        let full_data = self.read_all_chunks(&extent_map)?;
-
-        let start = offset as usize;
-        if start >= full_data.len() {
+        if len == 0 || offset >= file_inode.size {
             return Ok(Vec::new());
         }
-        let end = std::cmp::min(start + len, full_data.len());
-        Ok(full_data[start..end].to_vec())
+
+        let extent_map: ExtentMap = self.read_obj(file_inode.extent_map_ref.block_id)?;
+        self.read_chunk_range(&extent_map, file_inode.size, offset, len)
     }
 
     /// List entries in a directory at the given path.
@@ -1021,6 +1025,10 @@ impl FilesystemCore {
         let mut stale_blocks: Vec<u64> = Vec::new();
 
         // Write each dirty chunk to a new block.
+        // Pre-encrypt all dirty chunks and allocate blocks, then batch-write.
+        let block_size = self.store.block_size();
+        let mut batch: Vec<(u64, Vec<u8>)> = Vec::with_capacity(dirty.dirty_chunks.len());
+
         for (&chunk_idx, chunk_data) in &dirty.dirty_chunks {
             // If this chunk already existed, the old data block is stale.
             if let Some(existing) = extent_map
@@ -1032,14 +1040,14 @@ impl FilesystemCore {
             }
 
             let data_block = self.allocator.allocate()?;
-            write_encrypted_raw(
-                self.store.as_ref(),
+            let encrypted_block = prepare_encrypted_block(
+                block_size,
                 self.crypto.as_ref(),
                 &self.codec,
-                data_block,
                 ObjectKind::FileDataChunk,
                 chunk_data,
             )?;
+            batch.push((data_block, encrypted_block));
 
             if let Some(entry) = extent_map
                 .entries
@@ -1055,6 +1063,20 @@ impl FilesystemCore {
                     plaintext_len: chunk_data.len() as u32,
                 });
             }
+        }
+
+        // Single batched write for all dirty chunks.
+        {
+            let mut cache = self.obj_cache.borrow_mut();
+            for &(id, _) in &batch {
+                cache.pop(&id);
+            }
+            drop(cache);
+            let refs: Vec<(u64, &[u8])> = batch
+                .iter()
+                .map(|(id, data)| (*id, data.as_slice()))
+                .collect();
+            self.store.write_blocks(&refs)?;
         }
 
         extent_map.entries.sort_by_key(|e| e.chunk_index);
@@ -1193,12 +1215,19 @@ impl FilesystemCore {
     }
 
     fn read_obj<T: serde::de::DeserializeOwned>(&self, block_id: u64) -> FsResult<T> {
-        read_encrypted_object(
+        let mut cache = self.obj_cache.borrow_mut();
+        if let Some(plaintext) = cache.get(&block_id) {
+            return self.codec.deserialize_object(plaintext);
+        }
+        let plaintext = decrypt_block_to_plaintext(
             self.store.as_ref(),
             self.crypto.as_ref(),
             &self.codec,
             block_id,
-        )
+        )?;
+        let result = self.codec.deserialize_object(&plaintext);
+        cache.put(block_id, plaintext);
+        result
     }
 
     fn write_obj<T: serde::Serialize>(
@@ -1207,6 +1236,9 @@ impl FilesystemCore {
         kind: ObjectKind,
         obj: &T,
     ) -> FsResult<()> {
+        // Invalidate any cached plaintext for this block (freed blocks may be
+        // reallocated and written with different content).
+        self.obj_cache.borrow_mut().pop(&block_id);
         write_encrypted_object(
             self.store.as_ref(),
             self.crypto.as_ref(),
@@ -1217,27 +1249,68 @@ impl FilesystemCore {
         )
     }
 
-    fn read_all_chunks(&self, extent_map: &ExtentMap) -> FsResult<Vec<u8>> {
-        let mut entries = extent_map.entries.clone();
-        entries.sort_by_key(|e| e.chunk_index);
+    /// Read only the chunks that overlap `[offset, offset+len)` from the
+    /// extent map, avoiding the cost of decrypting the entire file.
+    fn read_chunk_range(
+        &self,
+        extent_map: &ExtentMap,
+        file_size: u64,
+        offset: u64,
+        len: usize,
+    ) -> FsResult<Vec<u8>> {
+        let chunk_size = max_chunk_payload(self.store.block_size());
+        let end = std::cmp::min(offset as usize + len, file_size as usize);
+        let start = offset as usize;
+        if start >= end || chunk_size == 0 {
+            return Ok(Vec::new());
+        }
 
-        let mut buf = Vec::new();
-        for entry in &entries {
-            let chunk = read_encrypted_raw(
-                self.store.as_ref(),
-                self.crypto.as_ref(),
-                &self.codec,
-                entry.data_ref.block_id,
-            )?;
-            // Only take plaintext_len bytes (chunk may have been decrypted from padded block).
-            let len = entry.plaintext_len as usize;
-            if len <= chunk.len() {
-                buf.extend_from_slice(&chunk[..len]);
+        let first_chunk = (start / chunk_size) as u64;
+        let last_chunk = ((end - 1) / chunk_size) as u64;
+        let mut result = Vec::with_capacity(end - start);
+
+        for chunk_idx in first_chunk..=last_chunk {
+            let chunk_file_start = chunk_idx as usize * chunk_size;
+
+            // Find the extent entry for this chunk via binary search.
+            let chunk_data = if let Ok(pos) = extent_map
+                .entries
+                .binary_search_by_key(&chunk_idx, |e| e.chunk_index)
+            {
+                let entry = &extent_map.entries[pos];
+                let raw = read_encrypted_raw(
+                    self.store.as_ref(),
+                    self.crypto.as_ref(),
+                    &self.codec,
+                    entry.data_ref.block_id,
+                )?;
+                let plain_len = std::cmp::min(entry.plaintext_len as usize, raw.len());
+                raw[..plain_len].to_vec()
             } else {
-                buf.extend_from_slice(&chunk);
+                // Sparse hole: return zeros up to chunk boundary or file end.
+                let hole_end = std::cmp::min(chunk_file_start + chunk_size, file_size as usize);
+                vec![0u8; hole_end - chunk_file_start]
+            };
+
+            // Slice to the requested range within this chunk.
+            let read_start = if chunk_idx == first_chunk {
+                start - chunk_file_start
+            } else {
+                0
+            };
+            let read_end = if chunk_idx == last_chunk {
+                end - chunk_file_start
+            } else {
+                chunk_data.len()
+            };
+            let read_end = std::cmp::min(read_end, chunk_data.len());
+
+            if read_start < read_end {
+                result.extend_from_slice(&chunk_data[read_start..read_end]);
             }
         }
-        Ok(buf)
+
+        Ok(result)
     }
 
     fn read_storage_header(&self) -> FsResult<StorageHeader> {
