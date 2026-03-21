@@ -179,6 +179,42 @@ public final class DoubleCryptFS {
         return DoubleCryptFS(handle: handle)
     }
 
+    /// Connect to a remote `doublecrypt-server` over TLS.
+    ///
+    /// The server address, TLS server name (SNI), and a CA certificate are
+    /// required.  Authentication is derived automatically from the master key
+    /// via HKDF.  A local write-back LRU cache sits in front of the network
+    /// store.
+    ///
+    /// - Parameters:
+    ///   - addr: Server address, e.g. `"10.0.0.5:9100"`.
+    ///   - serverName: TLS SNI hostname, e.g. `"dc-server"`.
+    ///   - caCertPath: Path to the CA certificate PEM file used to verify the server.
+    ///   - cacheBlocks: Number of blocks to cache locally. Pass 0 for the default (256).
+    ///   - key: 32-byte master encryption key.
+    public static func connectToServer(
+        addr: String,
+        serverName: String,
+        caCertPath: String,
+        cacheBlocks: UInt32 = 0,
+        key: Data
+    ) throws -> DoubleCryptFS {
+        let handle: OpaquePointer? = key.withUnsafeBytes { keyBuf -> OpaquePointer? in
+            guard let ptr = keyBuf.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
+                return nil
+            }
+            return addr.withCString { cAddr in
+                serverName.withCString { cSni in
+                    caCertPath.withCString { cCa in
+                        fs_create_network(cAddr, cSni, cCa, cacheBlocks, ptr, UInt(keyBuf.count))
+                    }
+                }
+            }
+        }
+        guard let handle else { throw DoubleCryptError.ioError }
+        return DoubleCryptFS(handle: handle)
+    }
+
     // MARK: - Lifecycle
 
     /// Initialize a fresh filesystem on the block store. Call once after ``createOnDisk(path:totalBlocks:blockSize:key:)`` or ``createInMemory(totalBlocks:key:)``.

@@ -1,6 +1,6 @@
 [package]
 name = "doublecrypt-core"
-version = "0.1.14"
+version = "0.1.15"
 edition = "2021"
 description = "Encrypted filesystem core library with C ABI for cross-platform frontends"
 license = "MIT"
@@ -23,16 +23,11 @@ serde_json = "1"
 lru = "0.12"
 prost = "0.13"
 
-# Network block store (optional, behind "network" feature)
-rustls = { version = "0.23", optional = true, default-features = false, features = [
+rustls = { version = "0.23", default-features = false, features = [
     "std",
     "ring",
 ] }
-rustls-pemfile = { version = "2", optional = true }
-
-[features]
-default = ["network"]
-network = ["dep:rustls", "dep:rustls-pemfile"]
+rustls-pemfile = "2"
 
 [dev-dependencies]
 # tests use the library directly

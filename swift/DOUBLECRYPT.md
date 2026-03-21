@@ -60,7 +60,20 @@ try fs.mount()              // read existing root pointers — call after open
 // Option C: In-memory (for unit tests, no disk I/O)
 let fs = try DoubleCryptFS.createInMemory(totalBlocks: 64, key: key)
 try fs.initFilesystem()
+
+// Option D: Connect to a remote doublecrypt-server over TLS
+let fs = try DoubleCryptFS.connectToServer(
+    addr: "10.0.0.5:9100",      // server address
+    serverName: "dc-server",     // TLS SNI hostname
+    caCertPath: "/path/to/ca.pem", // CA certificate for server verification
+    cacheBlocks: 256,            // local LRU cache size (0 = default 256)
+    key: key
+)
+try fs.mount()                   // read existing root pointers from remote store
 ```
+
+> **Network mode** uses key-derived authentication (HKDF) — no separate credentials needed.
+> A local write-back LRU cache sits in front of the TLS connection for performance.
 
 ### File Operations
 

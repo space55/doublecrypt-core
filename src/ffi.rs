@@ -19,10 +19,12 @@ use std::ptr;
 use std::sync::Arc;
 
 use crate::block_store::{DeviceBlockStore, DiskBlockStore, MemoryBlockStore};
+use crate::cached_store::CachedBlockStore;
 use crate::crypto::ChaChaEngine;
 use crate::error::FsErrorCode;
 use crate::fs::FilesystemCore;
 use crate::model::DEFAULT_BLOCK_SIZE;
+use crate::network_store::NetworkBlockStoreConfig;
 
 /// Opaque handle to a FilesystemCore instance.
 pub struct FsHandle {
@@ -174,6 +176,76 @@ pub unsafe extern "C" fn fs_create_device(
             Err(_) => return ptr::null_mut(),
         }
     };
+
+    let crypto = match ChaChaEngine::new(key_slice) {
+        Ok(c) => Arc::new(c),
+        Err(_) => return ptr::null_mut(),
+    };
+
+    let core = FilesystemCore::new(store, crypto);
+    let handle = Box::new(FsHandle { core });
+    Box::into_raw(handle)
+}
+
+/// Create a filesystem handle backed by a remote `doublecrypt-server` over TLS.
+///
+/// The connection uses key-derived authentication (HKDF from the master key)
+/// and wraps the network store in a write-back LRU cache.
+///
+/// `addr`: null-terminated server address, e.g. `"10.0.0.5:9100"`.
+/// `server_name`: null-terminated TLS SNI hostname, e.g. `"dc-server"`.
+/// `ca_cert_path`: null-terminated path to the CA certificate PEM file.
+/// `cache_blocks`: number of blocks to cache locally (0 = default 256).
+/// `master_key`: pointer to the master encryption key bytes.
+/// `master_key_len`: length of master_key in bytes (should be 32).
+///
+/// Returns a pointer to an opaque handle, or null on failure (connection
+/// refused, TLS error, authentication failure, etc.).
+///
+/// # Safety
+/// - `addr`, `server_name`, and `ca_cert_path` must be valid null-terminated C strings.
+/// - `master_key` must point to `master_key_len` valid bytes.
+#[no_mangle]
+pub unsafe extern "C" fn fs_create_network(
+    addr: *const c_char,
+    server_name: *const c_char,
+    ca_cert_path: *const c_char,
+    cache_blocks: u32,
+    master_key: *const u8,
+    master_key_len: usize,
+) -> *mut FsHandle {
+    if master_key.is_null() || master_key_len == 0 {
+        return ptr::null_mut();
+    }
+    let addr_str = match unsafe { unsafe_cstr_to_str(addr) } {
+        Some(s) => s,
+        None => return ptr::null_mut(),
+    };
+    let sni_str = match unsafe { unsafe_cstr_to_str(server_name) } {
+        Some(s) => s,
+        None => return ptr::null_mut(),
+    };
+    let ca_str = match unsafe { unsafe_cstr_to_str(ca_cert_path) } {
+        Some(s) => s,
+        None => return ptr::null_mut(),
+    };
+    let key_slice = unsafe { std::slice::from_raw_parts(master_key, master_key_len) };
+
+    let config = NetworkBlockStoreConfig::new(addr_str, sni_str)
+        .ca_cert(ca_str)
+        .auth_token(key_slice);
+
+    let net_store = match crate::network_store::NetworkBlockStore::from_config(config) {
+        Ok(s) => s,
+        Err(_) => return ptr::null_mut(),
+    };
+
+    let cap = if cache_blocks == 0 {
+        256
+    } else {
+        cache_blocks as usize
+    };
+    let store = Arc::new(CachedBlockStore::new(net_store, cap));
 
     let crypto = match ChaChaEngine::new(key_slice) {
         Ok(c) => Arc::new(c),

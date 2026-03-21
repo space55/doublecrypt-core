@@ -1,5 +1,4 @@
 module CDoubleCrypt {
     header "../../include/doublecrypt_core.h"
-    link "doublecrypt_core"
     export *
 }

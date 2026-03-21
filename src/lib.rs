@@ -30,7 +30,6 @@ pub mod fs;
 pub mod model;
 pub mod transaction;
 
-#[cfg(feature = "network")]
 pub mod network_store;
 pub mod proto;
 
