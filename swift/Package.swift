@@ -2,15 +2,11 @@
 import PackageDescription
 import Foundation
 
-// Compute the absolute path to the Rust library output directories.
-// This Package.swift lives at doublecrypt-core/swift/Package.swift,
-// so the parent directory (../) is doublecrypt-core/.
+// Compute absolute path to the Rust static library.
+// This Package.swift lives at doublecrypt-core/swift/Package.swift.
 let packageDir = URL(fileURLWithPath: #filePath).deletingLastPathComponent().path
 let coreRoot   = URL(fileURLWithPath: packageDir).deletingLastPathComponent().path
-let releaseLib = coreRoot + "/target/release"
-let debugLib   = coreRoot + "/target/debug"
-let staticLibRelease = releaseLib + "/libdoublecrypt_core.a"
-let staticLibDebug   = debugLib   + "/libdoublecrypt_core.a"
+let staticLibRelease = coreRoot + "/target/release/libdoublecrypt_core.a"
 
 let package = Package(
     name: "DoubleCryptCore",
@@ -19,7 +15,6 @@ let package = Package(
         .library(name: "DoubleCryptCore", targets: ["DoubleCryptCore"]),
     ],
     targets: [
-        // System library that imports the C header via module.modulemap.
         .systemLibrary(
             name: "CDoubleCrypt",
             path: "CDoubleCrypt"
@@ -29,8 +24,7 @@ let package = Package(
             dependencies: ["CDoubleCrypt"],
             path: "Sources/DoubleCryptCore",
             linkerSettings: [
-                // Force-load the static library directly (not -l which prefers .dylib).
-                // We try release first; if it doesn't exist the debug one will be used.
+                // Force-load the static .a (not -l which prefers .dylib).
                 .unsafeFlags([
                     "-force_load", staticLibRelease,
                 ]),

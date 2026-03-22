@@ -182,8 +182,7 @@ public final class DoubleCryptFS {
     /// Connect to a remote `doublecrypt-server` over TLS.
     ///
     /// The server address, TLS server name (SNI), and a CA certificate are
-    /// required.  Authentication is derived automatically from the master key
-    /// via HKDF.  A local write-back LRU cache sits in front of the network
+    /// required.  A local write-back LRU cache sits in front of the network
     /// store.
     ///
     /// - Parameters:
@@ -191,22 +190,43 @@ public final class DoubleCryptFS {
     ///   - serverName: TLS SNI hostname, e.g. `"dc-server"`.
     ///   - caCertPath: Path to the CA certificate PEM file used to verify the server.
     ///   - cacheBlocks: Number of blocks to cache locally. Pass 0 for the default (256).
-    ///   - key: 32-byte master encryption key.
+    ///   - authToken: 32-byte auth token for the server. Pass `nil` to derive automatically from `key` via HKDF.
+    ///   - key: 32-byte master encryption key (used for data encryption).
     public static func connectToServer(
         addr: String,
         serverName: String,
         caCertPath: String,
         cacheBlocks: UInt32 = 0,
+        authToken: Data? = nil,
         key: Data
     ) throws -> DoubleCryptFS {
         let handle: OpaquePointer? = key.withUnsafeBytes { keyBuf -> OpaquePointer? in
-            guard let ptr = keyBuf.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
+            guard let keyPtr = keyBuf.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
                 return nil
             }
-            return addr.withCString { cAddr in
-                serverName.withCString { cSni in
-                    caCertPath.withCString { cCa in
-                        fs_create_network(cAddr, cSni, cCa, cacheBlocks, ptr, UInt(keyBuf.count))
+            if let authToken = authToken {
+                return authToken.withUnsafeBytes { tokenBuf -> OpaquePointer? in
+                    guard let tokenPtr = tokenBuf.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
+                        return nil
+                    }
+                    return addr.withCString { cAddr in
+                        serverName.withCString { cSni in
+                            caCertPath.withCString { cCa in
+                                fs_create_network(cAddr, cSni, cCa, cacheBlocks,
+                                                  tokenPtr, UInt(tokenBuf.count),
+                                                  keyPtr, UInt(keyBuf.count))
+                            }
+                        }
+                    }
+                }
+            } else {
+                return addr.withCString { cAddr in
+                    serverName.withCString { cSni in
+                        caCertPath.withCString { cCa in
+                            fs_create_network(cAddr, cSni, cCa, cacheBlocks,
+                                              nil, 0,
+                                              keyPtr, UInt(keyBuf.count))
+                        }
                     }
                 }
             }
@@ -331,6 +351,28 @@ public final class DoubleCryptFS {
     /// preventing an attacker from determining how much data is stored.
     public func scrubFreeBlocks() throws {
         try check(fs_scrub_free_blocks(handle))
+    }
+
+    // MARK: - Hashing
+
+    /// Compute a BLAKE3 hash of the given data.
+    ///
+    /// Returns a 32-byte `Data` containing the hash.
+    public static func blake3(_ data: Data) throws -> Data {
+        var out = Data(count: 32)
+        let rc = data.withUnsafeBytes { dataPtr -> Int32 in
+            out.withUnsafeMutableBytes { outPtr in
+                fs_blake3(
+                    dataPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                    UInt(data.count),
+                    outPtr.baseAddress?.assumingMemoryBound(to: UInt8.self)
+                )
+            }
+        }
+        if rc != 0 {
+            throw DoubleCryptError(rawValue: rc) ?? .internalError
+        }
+        return out
     }
 
     // MARK: - Private

@@ -529,18 +529,35 @@ fn establish_connection(
 // ── TLS configuration ───────────────────────────────────────
 
 fn build_client_tls_config(ca_path: &Path) -> FsResult<Arc<ClientConfig>> {
-    let ca_pem = std::fs::read(ca_path)
-        .map_err(|e| FsError::Internal(format!("read CA cert {}: {e}", ca_path.display())))?;
-    let ca_certs: Vec<CertificateDer<'static>> =
-        rustls_pemfile::certs(&mut BufReader::new(&*ca_pem))
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|e| FsError::Internal(format!("parse CA certs: {e}")))?;
-
     let mut root_store = rustls::RootCertStore::empty();
-    for cert in ca_certs {
-        root_store
-            .add(cert)
-            .map_err(|e| FsError::Internal(format!("add CA cert: {e}")))?;
+
+    if ca_path.as_os_str().is_empty() {
+        // Use system CA certificates.
+        let native_certs = rustls_native_certs::load_native_certs();
+        for cert in native_certs.certs {
+            root_store
+                .add(cert)
+                .map_err(|e| FsError::Internal(format!("add native CA cert: {e}")))?;
+        }
+        if root_store.is_empty() {
+            return Err(FsError::Internal(
+                "no system CA certificates found".into(),
+            ));
+        }
+    } else {
+        // Use the provided custom CA certificate file.
+        let ca_pem = std::fs::read(ca_path)
+            .map_err(|e| FsError::Internal(format!("read CA cert {}: {e}", ca_path.display())))?;
+        let ca_certs: Vec<CertificateDer<'static>> =
+            rustls_pemfile::certs(&mut BufReader::new(&*ca_pem))
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|e| FsError::Internal(format!("parse CA certs: {e}")))?;
+
+        for cert in ca_certs {
+            root_store
+                .add(cert)
+                .map_err(|e| FsError::Internal(format!("add CA cert: {e}")))?;
+        }
     }
 
     let config = ClientConfig::builder()

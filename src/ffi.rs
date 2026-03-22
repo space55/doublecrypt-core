@@ -192,18 +192,30 @@ pub unsafe extern "C" fn fs_create_device(
 /// The connection uses key-derived authentication (HKDF from the master key)
 /// and wraps the network store in a write-back LRU cache.
 ///
+/// Create a filesystem handle backed by a remote `doublecrypt-server` over TLS.
+///
+/// The connection uses key-derived authentication (HKDF from the master key)
+/// and wraps the network store in a write-back LRU cache.
+///
 /// `addr`: null-terminated server address, e.g. `"10.0.0.5:9100"`.
 /// `server_name`: null-terminated TLS SNI hostname, e.g. `"dc-server"`.
 /// `ca_cert_path`: null-terminated path to the CA certificate PEM file.
 /// `cache_blocks`: number of blocks to cache locally (0 = default 256).
+/// `auth_token`: pointer to 32 bytes of auth token, or null to derive from `master_key`.
+/// `auth_token_len`: length of auth_token in bytes (must be 32 if non-null, ignored if null).
 /// `master_key`: pointer to the master encryption key bytes.
 /// `master_key_len`: length of master_key in bytes (should be 32).
+///
+/// When `auth_token` is null, the auth token is derived from `master_key` via
+/// HKDF (the original behaviour).  When `auth_token` is provided, it is used
+/// directly and `master_key` is used only for encryption.
 ///
 /// Returns a pointer to an opaque handle, or null on failure (connection
 /// refused, TLS error, authentication failure, etc.).
 ///
 /// # Safety
 /// - `addr`, `server_name`, and `ca_cert_path` must be valid null-terminated C strings.
+/// - `auth_token`, if non-null, must point to `auth_token_len` valid bytes.
 /// - `master_key` must point to `master_key_len` valid bytes.
 #[no_mangle]
 pub unsafe extern "C" fn fs_create_network(
@@ -211,6 +223,8 @@ pub unsafe extern "C" fn fs_create_network(
     server_name: *const c_char,
     ca_cert_path: *const c_char,
     cache_blocks: u32,
+    auth_token: *const u8,
+    auth_token_len: usize,
     master_key: *const u8,
     master_key_len: usize,
 ) -> *mut FsHandle {
@@ -231,9 +245,18 @@ pub unsafe extern "C" fn fs_create_network(
     };
     let key_slice = unsafe { std::slice::from_raw_parts(master_key, master_key_len) };
 
-    let config = NetworkBlockStoreConfig::new(addr_str, sni_str)
-        .ca_cert(ca_str)
-        .auth_token(key_slice);
+    let config = if !auth_token.is_null() && auth_token_len == 32 {
+        let token_slice = unsafe { std::slice::from_raw_parts(auth_token, 32) };
+        let mut token = [0u8; 32];
+        token.copy_from_slice(token_slice);
+        NetworkBlockStoreConfig::new(addr_str, sni_str)
+            .ca_cert(ca_str)
+            .auth_token_raw(token)
+    } else {
+        NetworkBlockStoreConfig::new(addr_str, sni_str)
+            .ca_cert(ca_str)
+            .auth_token(key_slice)
+    };
 
     let net_store = match crate::network_store::NetworkBlockStore::from_config(config) {
         Ok(s) => s,
@@ -664,6 +687,25 @@ pub unsafe extern "C" fn fs_scrub_free_blocks(handle: *mut FsHandle) -> i32 {
         Ok(()) => FsErrorCode::Ok as i32,
         Err(ref e) => FsErrorCode::from(e) as i32,
     }
+}
+
+/// Compute a BLAKE3 hash of the supplied data.
+///
+/// Writes exactly 32 bytes into `out`. Returns 0 on success,
+/// or `InvalidArgument` if any pointer is null.
+///
+/// # Safety
+/// `data` must point to `data_len` valid bytes.
+/// `out` must point to a buffer of at least 32 bytes.
+#[no_mangle]
+pub unsafe extern "C" fn fs_blake3(data: *const u8, data_len: usize, out: *mut u8) -> i32 {
+    if data.is_null() || out.is_null() {
+        return FsErrorCode::InvalidArgument as i32;
+    }
+    let input = unsafe { std::slice::from_raw_parts(data, data_len) };
+    let hash = blake3::hash(input);
+    unsafe { std::ptr::copy_nonoverlapping(hash.as_bytes().as_ptr(), out, 32) };
+    FsErrorCode::Ok as i32
 }
 
 /// Free a string previously returned by `fs_list_root`.
