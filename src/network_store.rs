@@ -251,18 +251,27 @@ impl NetworkBlockStore {
         let mut results = Vec::with_capacity(block_ids.len());
 
         for chunk in block_ids.chunks(PIPELINE_BATCH) {
-            // Send all requests in this batch.
-            for &block_id in chunk {
-                let id = self.next_id();
-                send_message(
-                    stream,
-                    &proto::Request {
-                        request_id: id,
-                        command: Some(proto::request::Command::ReadBlock(
-                            proto::ReadBlockRequest { block_id },
-                        )),
-                    },
-                )?;
+            // Wrap in a BufWriter so all requests in this chunk are
+            // coalesced into fewer TLS records (one flush at the end).
+            {
+                let mut bw = std::io::BufWriter::with_capacity(
+                    chunk.len() * 32, // read requests are small
+                    &mut *stream,
+                );
+                for &block_id in chunk {
+                    let id = self.next_id();
+                    send_message_no_flush(
+                        &mut bw,
+                        &proto::Request {
+                            request_id: id,
+                            command: Some(proto::request::Command::ReadBlock(
+                                proto::ReadBlockRequest { block_id },
+                            )),
+                        },
+                    )?;
+                }
+                bw.flush()
+                    .map_err(|e| FsError::Internal(format!("flush pipeline: {e}")))?;
             }
 
             // Read all responses.
@@ -288,20 +297,30 @@ impl NetworkBlockStore {
         blocks: &[(u64, &[u8])],
     ) -> FsResult<()> {
         for chunk in blocks.chunks(PIPELINE_BATCH) {
-            for &(block_id, data) in chunk {
-                let id = self.next_id();
-                send_message(
-                    stream,
-                    &proto::Request {
-                        request_id: id,
-                        command: Some(proto::request::Command::WriteBlock(
-                            proto::WriteBlockRequest {
-                                block_id,
-                                data: data.to_vec(),
-                            },
-                        )),
-                    },
-                )?;
+            // Wrap in a BufWriter so multiple write requests are batched
+            // into fewer TLS records.
+            {
+                let mut bw = std::io::BufWriter::with_capacity(
+                    chunk.len() * (32 + chunk.first().map_or(0, |(_, d)| d.len())),
+                    &mut *stream,
+                );
+                for &(block_id, data) in chunk {
+                    let id = self.next_id();
+                    send_message_no_flush(
+                        &mut bw,
+                        &proto::Request {
+                            request_id: id,
+                            command: Some(proto::request::Command::WriteBlock(
+                                proto::WriteBlockRequest {
+                                    block_id,
+                                    data: data.to_vec(),
+                                },
+                            )),
+                        },
+                    )?;
+                }
+                bw.flush()
+                    .map_err(|e| FsError::Internal(format!("flush pipeline: {e}")))?;
             }
 
             for _ in chunk {
@@ -469,6 +488,18 @@ fn send_message<W: Write>(w: &mut W, msg: &proto::Request) -> FsResult<()> {
     Ok(())
 }
 
+/// Like `send_message` but without flushing.  Used by pipelined operations
+/// that batch many messages and flush once at the end.
+fn send_message_no_flush<W: Write>(w: &mut W, msg: &proto::Request) -> FsResult<()> {
+    let payload = msg.encode_to_vec();
+    let len = payload.len() as u32;
+    w.write_all(&len.to_le_bytes())
+        .map_err(|e| FsError::Internal(format!("write length prefix: {e}")))?;
+    w.write_all(&payload)
+        .map_err(|e| FsError::Internal(format!("write payload: {e}")))?;
+    Ok(())
+}
+
 fn recv_message<R: Read>(r: &mut R) -> FsResult<proto::Response> {
     let mut len_buf = [0u8; 4];
     r.read_exact(&mut len_buf)
@@ -540,9 +571,7 @@ fn build_client_tls_config(ca_path: &Path) -> FsResult<Arc<ClientConfig>> {
                 .map_err(|e| FsError::Internal(format!("add native CA cert: {e}")))?;
         }
         if root_store.is_empty() {
-            return Err(FsError::Internal(
-                "no system CA certificates found".into(),
-            ));
+            return Err(FsError::Internal("no system CA certificates found".into()));
         }
     } else {
         // Use the provided custom CA certificate file.
