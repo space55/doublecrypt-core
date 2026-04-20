@@ -1,5 +1,6 @@
 use crate::error::{FsError, FsResult};
 use crate::model::FIRST_DATA_BLOCK;
+use rand::Rng;
 use std::collections::BTreeSet;
 use std::sync::Mutex;
 
@@ -47,7 +48,10 @@ impl BitmapAllocator {
 
     /// Mark a block as already allocated (used during mount/recovery).
     pub fn mark_allocated(&self, block_id: u64) -> FsResult<()> {
-        let mut state = self.state.lock().map_err(|e| FsError::Internal(e.to_string()))?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|e| FsError::Internal(e.to_string()))?;
         state.free_set.remove(&block_id);
         state.allocated.insert(block_id);
         Ok(())
@@ -68,8 +72,18 @@ impl BitmapAllocator {
 
 impl SlotAllocator for BitmapAllocator {
     fn allocate(&self) -> FsResult<u64> {
-        let mut state = self.state.lock().map_err(|e| FsError::Internal(e.to_string()))?;
-        let block_id = *state.free_set.iter().next().ok_or(FsError::NoFreeBlocks)?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|e| FsError::Internal(e.to_string()))?;
+        let len = state.free_set.len();
+        if len == 0 {
+            return Err(FsError::NoFreeBlocks);
+        }
+        // Pick a uniformly random block from the free set to scatter allocations
+        // across the disk, making it harder to infer file layout or usage patterns.
+        let idx = rand::thread_rng().gen_range(0..len);
+        let block_id = *state.free_set.iter().nth(idx).unwrap();
         state.free_set.remove(&block_id);
         state.allocated.insert(block_id);
         Ok(block_id)
@@ -79,7 +93,10 @@ impl SlotAllocator for BitmapAllocator {
         if block_id >= self.total_blocks || block_id < FIRST_DATA_BLOCK {
             return Err(FsError::BlockOutOfRange(block_id));
         }
-        let mut state = self.state.lock().map_err(|e| FsError::Internal(e.to_string()))?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|e| FsError::Internal(e.to_string()))?;
         state.allocated.remove(&block_id);
         state.free_set.insert(block_id);
         Ok(())
